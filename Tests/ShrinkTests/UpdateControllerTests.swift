@@ -17,7 +17,7 @@ private actor FeedCalls {
         let contents = root.appending(path: "Shrink.app/Contents")
         try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
         let info: NSDictionary = [
-            "CFBundleIdentifier": "com.mpuskac.shrink",
+            "CFBundleIdentifier": "sk.icebear.shrink",
             "CFBundleShortVersionString": version,
             "CFBundlePackageType": "APPL",
             "ShrinkUpdateRepository": "mattonik/shrink",

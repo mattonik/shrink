@@ -57,9 +57,9 @@ private func releaseJSON(
 }
 
 @Test func pinsTheSigningRequirementToOneTeamAndApp() throws {
-    let verifier = try DeveloperIDVerifier(teamID: "ABCDE12345", bundleIdentifier: "com.mpuskac.shrink")
+    let verifier = try DeveloperIDVerifier(teamID: "ABCDE12345", bundleIdentifier: "sk.icebear.shrink")
     #expect(verifier.requirement.contains(#"certificate leaf[subject.OU] = "ABCDE12345""#))
-    #expect(verifier.requirement.contains(#"identifier "com.mpuskac.shrink""#))
+    #expect(verifier.requirement.contains(#"identifier "sk.icebear.shrink""#))
     // The string must compile, or every update would fail at install time.
     var compiled: SecRequirement?
     #expect(SecRequirementCreateWithString(verifier.requirement as CFString, [], &compiled) == errSecSuccess)
@@ -68,7 +68,7 @@ private func releaseJSON(
 @Test func refusesMalformedTeamIDs() {
     for bad in ["", "abcde12345", "ABCDE1234", "ABCDE12345X", #"ABCDE1234""#, "ABCDE 2345"] {
         #expect(throws: UpdateError.self) {
-            try DeveloperIDVerifier(teamID: bad, bundleIdentifier: "com.mpuskac.shrink")
+            try DeveloperIDVerifier(teamID: bad, bundleIdentifier: "sk.icebear.shrink")
         }
     }
 }

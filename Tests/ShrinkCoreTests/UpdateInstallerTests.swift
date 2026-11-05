@@ -14,7 +14,7 @@ private struct AcceptAnything: UpdateVerifying {
 private struct Fixture {
     let directory: URL
     let installed: URL
-    let bundleIdentifier = "com.mpuskac.shrink"
+    let bundleIdentifier = "sk.icebear.shrink"
 
     init() throws {
         directory = URL.temporaryDirectory.appending(path: "shrink-update-\(UUID().uuidString)")
@@ -115,7 +115,7 @@ private struct Fixture {
     /// Calculator is validly signed and Gatekeeper accepts it — just not from
     /// this team or with this identifier, so only the requirement can stop it.
     @Test func theRealVerifierRejectsATrustedAppFromSomeoneElse() async throws {
-        let verifier = try DeveloperIDVerifier(teamID: "ABCDE12345", bundleIdentifier: "com.mpuskac.shrink")
+        let verifier = try DeveloperIDVerifier(teamID: "ABCDE12345", bundleIdentifier: "sk.icebear.shrink")
         await #expect(throws: UpdateError.self) {
             try await verifier.verify(URL(filePath: "/System/Applications/Calculator.app"))
         }
@@ -213,7 +213,7 @@ private struct Fixture {
         let environment = ProcessInfo.processInfo.environment
         let app = URL(filePath: try #require(environment["SHRINK_VERIFY_APP"]))
         let verifier = try DeveloperIDVerifier(
-            teamID: try #require(environment["SHRINK_TEAM_ID"]), bundleIdentifier: "com.mpuskac.shrink")
+            teamID: try #require(environment["SHRINK_TEAM_ID"]), bundleIdentifier: "sk.icebear.shrink")
         try await verifier.verify(app)
     }
 }
