@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Bindable var model: AppModel
+    @Bindable var updates: UpdateController
     @State private var isDropTargeted = false
 
     var body: some View {
@@ -13,10 +14,20 @@ struct ContentView: View {
                 MissingToolsView(model: model)
             }
         }
+        .alert(
+            updates.notice?.title ?? "",
+            isPresented: Binding(get: { updates.notice != nil }, set: { if !$0 { updates.notice = nil } }),
+            presenting: updates.notice
+        ) { _ in
+            Button("OK") {}
+        } message: { notice in
+            Text(notice.message)
+        }
     }
 
     private var mainLayout: some View {
         VStack(spacing: 0) {
+            UpdateBanner(updates: updates, isConverting: model.isConverting)
             fileArea
             Divider()
             SettingsPanel(model: model)
@@ -102,6 +113,64 @@ struct ContentView: View {
         }
         let pending = model.items.filter { $0.isPending && $0.source != nil }.count
         return pending > 0 ? "\(pending) file\(pending == 1 ? "" : "s") ready" : ""
+    }
+}
+
+private struct UpdateBanner: View {
+    let updates: UpdateController
+    let isConverting: Bool
+
+    var body: some View {
+        switch updates.phase {
+        case .available(let release):
+            bar {
+                Image(systemName: "arrow.down.circle.fill").foregroundStyle(.tint)
+                Text("Shrink \(release.version.description) is available")
+                Spacer()
+                Link("What's New", destination: release.notesURL)
+                Button("Update & Relaunch") { Task { await updates.install(release) } }
+                    .disabled(isConverting)
+                    .help(isConverting ? "Finish or cancel the current conversion first" : "")
+                dismissButton
+            }
+        case .installing(let release):
+            bar {
+                ProgressView().controlSize(.small)
+                Text("Installing Shrink \(release.version.description)…")
+                Spacer()
+            }
+        case .installFailed(let release, let message):
+            bar {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text(message).lineLimit(2).font(.callout)
+                Spacer()
+                Button("Try Again") { Task { await updates.install(release) } }
+                    .disabled(isConverting)
+                dismissButton
+            }
+        case .idle, .checking:
+            EmptyView()
+        }
+    }
+
+    private var dismissButton: some View {
+        Button {
+            updates.dismiss()
+        } label: {
+            Image(systemName: "xmark").foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help("Not now")
+    }
+
+    private func bar(@ViewBuilder content: () -> some View) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10, content: content)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            Divider()
+        }
+        .background(.bar)
     }
 }
 

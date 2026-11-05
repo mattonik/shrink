@@ -5,16 +5,23 @@ import SwiftUI
 struct ShrinkApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
+    @State private var updates = UpdateController()
 
     var body: some Scene {
         Window("Shrink", id: "main") {
-            ContentView(model: model)
+            ContentView(model: model, updates: updates)
                 .frame(minWidth: 520, minHeight: 440)
-                .onAppear { appDelegate.deliverOpenedFiles(to: model.add(urls:)) }
+                .onAppear {
+                    appDelegate.deliverOpenedFiles(to: model.add(urls:))
+                    updates.checkInBackgroundIfDue()
+                }
         }
         .defaultSize(width: 620, height: 560)
         .windowResizability(.contentMinSize)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { Task { await updates.check(userInitiated: true) } }
+            }
             CommandGroup(after: .newItem) {
                 Button("Add Files…") { model.chooseFiles() }
                     .keyboardShortcut("o")

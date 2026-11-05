@@ -8,11 +8,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# shellcheck source=release.conf
+source ./release.conf
+
 APP_NAME="Shrink"
-BUNDLE_ID="com.mpuskac.shrink"
-VERSION="1.0"
 DEST="${1:-$HOME/Applications}"
 APP="$DEST/$APP_NAME.app"
+
+# Releases are git tags (v1.2.0). CI passes the tag in; a local build reports
+# the latest tag it contains, so it is only offered releases made after it.
+VERSION="${SHRINK_VERSION:-$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//')}"
+VERSION="${VERSION:-0.0.0}"
+BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+
+# "-" is an ad-hoc signature, fine for running on this Mac. The release
+# workflow passes a Developer ID identity so the build can be notarised.
+SIGN_IDENTITY="${SHRINK_SIGN_IDENTITY:--}"
 
 echo "==> Building release binary"
 swift build -c release
@@ -20,7 +31,8 @@ swift build -c release
 # A running instance keeps its old executable mapped in memory, so replacing
 # the bundle on disk changes nothing until the app is restarted. Quitting here
 # stops a stale window from quietly serving up the previous build.
-if pgrep -x "$APP_NAME" >/dev/null; then
+RUNNING_PID="$(pgrep -x "$APP_NAME" || true)"
+if [ -n "$RUNNING_PID" ] && ps -o comm= -p "$RUNNING_PID" | grep -q "^$APP/"; then
   echo "==> Quitting running $APP_NAME"
   osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
   for _ in $(seq 1 20); do
@@ -53,7 +65,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>$APP_NAME</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
+  <key>ShrinkUpdateRepository</key><string>$REPOSITORY</string>
+  <key>ShrinkUpdateTeamID</key><string>$TEAM_ID</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
@@ -86,10 +100,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature: arm64 refuses to run unsigned binaries, and re-signing the
-# assembled bundle keeps the signature covering the final Info.plist.
-echo "==> Signing (ad-hoc)"
-codesign --force --sign - "$APP" >/dev/null 2>&1
+# arm64 refuses to run unsigned code, and signing the assembled bundle keeps
+# the signature covering the final Info.plist.
+if [ "$SIGN_IDENTITY" = "-" ]; then
+  echo "==> Signing (ad-hoc)"
+  codesign --force --sign - "$APP" >/dev/null 2>&1
+else
+  # Notarisation requires the hardened runtime and a secure timestamp.
+  echo "==> Signing as $SIGN_IDENTITY"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+fi
 
-echo "==> Done: $APP"
+echo "==> Done: $APP ($VERSION, build $BUILD_NUMBER)"
 echo "    Launch it with: open -a $APP_NAME"
