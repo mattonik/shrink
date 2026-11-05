@@ -41,6 +41,7 @@ Originals are never touched.
 | Control        | What it does                                                        |
 | -------------- | ------------------------------------------------------------------- |
 | **Resolution** | Keep original, 1080p, 720p, 480p, or 75% / 50%. Never upscales.      |
+| *(portrait)*   | Presets size the **shorter** side, so 720p is 1280×720 landscape or 720×1280 portrait. |
 | **Quality**    | Smallest / Balanced / High — a CRF ladder, constant quality per frame. |
 | **Keep sound** | Off drops the audio track entirely (`-an`).                          |
 | **HEVC**       | H.265 instead of H.264: roughly 30–50% smaller, needs a recent player. |
@@ -65,6 +66,12 @@ barely change. The app also:
 
 - refuses to upscale, and rounds both axes to even numbers so `yuv420p` chroma
   subsampling is valid
+- reads the rotation from a file's display matrix and sizes from the dimensions
+  you actually see. Phones store portrait video as landscape frames plus a 90°
+  flag, and ffmpeg applies that rotation before any filter runs — sizing from
+  the stored dimensions squashes portrait clips into a landscape frame. The
+  rotation is baked into the output pixels, so the result needs no flag to
+  display correctly anywhere
 - tags HEVC output as `hvc1`, without which QuickTime and Safari will not play it
 - writes `+faststart` so the file can begin playing before it is fully downloaded
 - keeps any soft subtitle track that the source carried

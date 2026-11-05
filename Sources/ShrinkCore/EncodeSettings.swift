@@ -99,19 +99,27 @@ public struct EncodeSettings: Equatable, Sendable {
     }
 
     /// Target pixel size, or nil to pass the source resolution through.
+    ///
+    /// `source` must be the *display* size (see `VideoInfo.displaySize`), since
+    /// ffmpeg rotates before filtering. The `p` presets size the **shorter**
+    /// side, which is what makes them mean the same thing in both orientations:
+    /// 1920x1080 at 720p is 1280x720, and portrait 1080x1920 is 720x1280.
+    /// Keying off height instead would shrink portrait clips to a sliver.
+    ///
     /// Only ever scales down — asking 1080p of a 720p source returns nil rather
     /// than upscaling into a bigger file that holds no extra detail.
     public func targetSize(for source: PixelSize) -> PixelSize? {
         guard source.width > 0, source.height > 0 else { return nil }
 
+        let shorterSide = Double(min(source.width, source.height))
         let factor: Double
         switch resolution {
         case .original: return nil
         case .pct50: factor = 0.5
         case .pct75: factor = 0.75
-        case .p1080: factor = 1080.0 / Double(source.height)
-        case .p720: factor = 720.0 / Double(source.height)
-        case .p480: factor = 480.0 / Double(source.height)
+        case .p1080: factor = 1080.0 / shorterSide
+        case .p720: factor = 720.0 / shorterSide
+        case .p480: factor = 480.0 / shorterSide
         }
         guard factor < 1 else { return nil }
 
@@ -139,7 +147,7 @@ public struct EncodeSettings: Equatable, Sendable {
     }
 
     public func arguments(input: URL, output: URL, info: VideoInfo) -> [String] {
-        let target = targetSize(for: info.size)
+        let target = targetSize(for: info.displaySize)
         let withAudio = keepAudio && info.hasAudio
         // Soft subtitles cost almost nothing and some sources carry them, so
         // they ride along rather than being silently dropped.

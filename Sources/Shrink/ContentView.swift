@@ -163,7 +163,7 @@ private struct ItemRow: View {
     private var sourceSummary: String {
         guard let info = item.info else { return "Reading…" }
         var parts = [
-            "\(info.size.width)×\(info.size.height)",
+            "\(info.displaySize.width)×\(info.displaySize.height)",
             formatDuration(info.durationSeconds),
             formatBytes(info.byteCount),
         ]

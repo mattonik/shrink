@@ -1,12 +1,15 @@
 import Foundation
 
 public struct VideoInfo: Equatable, Sendable {
+    /// Dimensions as stored in the file, before any rotation is applied.
     public var size: PixelSize
     public var durationSeconds: Double
     public var byteCount: Int64
     public var videoCodec: String
     public var hasAudio: Bool
     public var hasSubtitles: Bool
+    /// Display-matrix rotation in degrees; iPhone portrait clips carry -90.
+    public var rotationDegrees: Int
 
     public init(
         size: PixelSize,
@@ -14,7 +17,8 @@ public struct VideoInfo: Equatable, Sendable {
         byteCount: Int64,
         videoCodec: String,
         hasAudio: Bool,
-        hasSubtitles: Bool
+        hasSubtitles: Bool,
+        rotationDegrees: Int = 0
     ) {
         self.size = size
         self.durationSeconds = durationSeconds
@@ -22,7 +26,22 @@ public struct VideoInfo: Equatable, Sendable {
         self.videoCodec = videoCodec
         self.hasAudio = hasAudio
         self.hasSubtitles = hasSubtitles
+        self.rotationDegrees = rotationDegrees
     }
+
+    /// The size the viewer actually sees. A phone records portrait footage as
+    /// landscape frames plus a 90-degree display matrix, and ffmpeg applies
+    /// that rotation before any filter runs — so every sizing decision has to
+    /// use these dimensions, not the coded ones, or portrait video gets
+    /// squashed into a landscape frame.
+    public var displaySize: PixelSize {
+        let normalized = ((rotationDegrees % 360) + 360) % 360
+        return normalized == 90 || normalized == 270
+            ? PixelSize(width: size.height, height: size.width)
+            : size
+    }
+
+    public var isPortrait: Bool { displaySize.height > displaySize.width }
 }
 
 public enum TranscodeError: LocalizedError {
@@ -116,11 +135,16 @@ public struct Transcoder: Sendable {
 
     static func parseProbe(_ data: Data, byteCount: Int64, name: String) throws -> VideoInfo {
         struct Payload: Decodable {
+            struct SideData: Decodable {
+                let rotation: Double?
+            }
             struct Stream: Decodable {
                 let codec_type: String?
                 let codec_name: String?
                 let width: Int?
                 let height: Int?
+                let side_data_list: [SideData]?
+                let tags: [String: String]?
             }
             struct Format: Decodable {
                 let duration: String?
@@ -134,13 +158,21 @@ public struct Transcoder: Sendable {
         guard let video = streams.first(where: { $0.codec_type == "video" }) else {
             throw TranscodeError.noVideoStream(name)
         }
+        // Modern ffprobe reports rotation in the Display Matrix side data;
+        // older files only carry a `rotate` tag, so both are read.
+        let rotation =
+            video.side_data_list?.compactMap(\.rotation).first
+            ?? video.tags?["rotate"].flatMap(Double.init)
+            ?? 0
+
         return VideoInfo(
             size: PixelSize(width: video.width ?? 0, height: video.height ?? 0),
             durationSeconds: Double(payload.format?.duration ?? "0") ?? 0,
             byteCount: byteCount,
             videoCodec: video.codec_name ?? "unknown",
             hasAudio: streams.contains { $0.codec_type == "audio" },
-            hasSubtitles: streams.contains { $0.codec_type == "subtitle" }
+            hasSubtitles: streams.contains { $0.codec_type == "subtitle" },
+            rotationDegrees: Int(rotation.rounded())
         )
     }
 

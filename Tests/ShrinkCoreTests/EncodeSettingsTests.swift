@@ -210,3 +210,81 @@ private func consecutive(_ args: [String], _ flag: String) -> String? {
     guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
     return args[index + 1]
 }
+
+// MARK: - Rotated (portrait phone) sources
+
+@Test func displaySizeSwapsAxesForQuarterTurns() {
+    let coded = PixelSize(width: 3840, height: 2160)
+    func rotated(_ degrees: Int) -> PixelSize {
+        info(size: coded).with(rotation: degrees).displaySize
+    }
+
+    // An iPhone portrait clip is stored landscape with a -90 display matrix.
+    #expect(rotated(-90) == PixelSize(width: 2160, height: 3840))
+    #expect(rotated(90) == PixelSize(width: 2160, height: 3840))
+    #expect(rotated(270) == PixelSize(width: 2160, height: 3840))
+    // A half turn still displays landscape.
+    #expect(rotated(180) == coded)
+    #expect(rotated(0) == coded)
+}
+
+@Test func presetsSizeTheShorterSideInBothOrientations() {
+    let landscape = PixelSize(width: 1920, height: 1080)
+    let portrait = PixelSize(width: 1080, height: 1920)
+
+    #expect(EncodeSettings(resolution: .p720).targetSize(for: landscape) == PixelSize(width: 1280, height: 720))
+    // The same preset on portrait footage keeps it portrait at 720 wide,
+    // rather than squashing it into a 1280x720 landscape frame.
+    #expect(EncodeSettings(resolution: .p720).targetSize(for: portrait) == PixelSize(width: 720, height: 1280))
+    #expect(EncodeSettings(resolution: .p1080).targetSize(for: portrait) == nil)
+}
+
+@Test func sizesARotated4KPhoneClipFromItsDisplayDimensions() {
+    // The real shape of the user's file: 3840x2160 coded, rotation -90.
+    let clip = info(size: PixelSize(width: 3840, height: 2160)).with(rotation: -90)
+    let target = EncodeSettings(resolution: .p720).targetSize(for: clip.displaySize)
+
+    #expect(target == PixelSize(width: 720, height: 1280))
+
+    let args = EncodeSettings(resolution: .p720).arguments(
+        input: URL(filePath: "/v/clip.MOV"),
+        output: URL(filePath: "/v/clip-720p.mp4"),
+        info: clip
+    )
+    #expect(args.contains("scale=720:1280:flags=lanczos"))
+}
+
+@Test func readsRotationFromDisplayMatrixAndLegacyTag() throws {
+    let matrix = """
+        {"streams":[{"codec_type":"video","codec_name":"hevc","width":3840,"height":2160,
+        "side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]}],
+        "format":{"duration":"10"}}
+        """
+    let fromMatrix = try Transcoder.parseProbe(Data(matrix.utf8), byteCount: 1, name: "a.mov")
+    #expect(fromMatrix.rotationDegrees == -90)
+    #expect(fromMatrix.displaySize == PixelSize(width: 2160, height: 3840))
+    #expect(fromMatrix.isPortrait)
+
+    // Older files carry the rotation as a string tag instead.
+    let legacy = """
+        {"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,
+        "tags":{"rotate":"90"}}],"format":{"duration":"10"}}
+        """
+    let fromTag = try Transcoder.parseProbe(Data(legacy.utf8), byteCount: 1, name: "b.mp4")
+    #expect(fromTag.rotationDegrees == 90)
+    #expect(fromTag.displaySize == PixelSize(width: 1080, height: 1920))
+
+    // No rotation information at all means no swap.
+    let plain = #"{"streams":[{"codec_type":"video","width":1920,"height":1080}],"format":{"duration":"5"}}"#
+    let unrotated = try Transcoder.parseProbe(Data(plain.utf8), byteCount: 1, name: "c.mp4")
+    #expect(unrotated.rotationDegrees == 0)
+    #expect(!unrotated.isPortrait)
+}
+
+extension VideoInfo {
+    fileprivate func with(rotation: Int) -> VideoInfo {
+        var copy = self
+        copy.rotationDegrees = rotation
+        return copy
+    }
+}

@@ -105,6 +105,103 @@ struct TranscodeIntegrationTests {
         #expect(!result.hasAudio)
     }
 
+    /// Wraps a clip in a display matrix, the way a phone stores portrait video:
+    /// landscape frames plus a rotation flag.
+    func makeRotatedSample(in directory: URL, degrees: Int, size: String = "640x360") throws -> URL {
+        let landscape = try makeSample(in: directory, name: "landscape.mp4", size: size, audio: false)
+        let output = directory.appending(path: "portrait.mov")
+        let process = Process()
+        process.executableURL = tools.ffmpeg
+        process.arguments = [
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-display_rotation", String(degrees), "-i", landscape.path,
+            "-c", "copy", output.path,
+        ]
+        try process.run()
+        process.waitUntilExit()
+        return output
+    }
+
+    @Test func readsRotationFromARealRotatedFile() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rotated = try makeRotatedSample(in: directory, degrees: 90)
+
+        let info = try runAsync { try await Transcoder(tools: tools).probe(rotated) }
+
+        #expect(info.size == PixelSize(width: 640, height: 360), "coded size stays landscape")
+        #expect(info.displaySize == PixelSize(width: 360, height: 640), "displays as portrait")
+        #expect(info.isPortrait)
+    }
+
+    /// The regression this suite exists for: a portrait phone clip used to come
+    /// out as a squashed landscape file, because sizing read the coded
+    /// dimensions while ffmpeg had already rotated the frames.
+    @Test func keepsAPortraitClipPortrait() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // 1920x1080 coded + 90 degrees = 1080x1920 on screen, like a phone clip.
+        let rotated = try makeRotatedSample(in: directory, degrees: 90, size: "1920x1080")
+        let transcoder = Transcoder(tools: tools)
+        let settings = EncodeSettings(resolution: .p480, keepAudio: false)
+        let output = directory.appending(path: settings.outputFileName(for: rotated))
+
+        let result = try runAsync { () -> VideoInfo in
+            let info = try await transcoder.probe(rotated)
+            for try await _ in transcoder.transcode(
+                input: rotated, output: output, settings: settings, info: info
+            ) {}
+            return try await transcoder.probe(output)
+        }
+
+        // 480p caps the shorter side, so the result is 480 wide, not 480 tall.
+        #expect(result.displaySize == PixelSize(width: 480, height: 852))
+        #expect(result.displaySize.height > result.displaySize.width, "must stay portrait")
+        // ffmpeg bakes the rotation into the pixels, so the output needs no flag.
+        #expect(result.rotationDegrees == 0)
+    }
+
+    /// A portrait clip already smaller than the preset is passed through rather
+    /// than blown up — the same no-upscale rule as landscape, measured on the
+    /// displayed shorter side.
+    @Test func doesNotUpscaleASmallPortraitClip() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rotated = try makeRotatedSample(in: directory, degrees: 90, size: "640x360")
+        let transcoder = Transcoder(tools: tools)
+        let settings = EncodeSettings(resolution: .p480, keepAudio: false)
+        let output = directory.appending(path: settings.outputFileName(for: rotated))
+
+        let result = try runAsync { () -> VideoInfo in
+            let info = try await transcoder.probe(rotated)
+            for try await _ in transcoder.transcode(
+                input: rotated, output: output, settings: settings, info: info
+            ) {}
+            return try await transcoder.probe(output)
+        }
+
+        #expect(result.displaySize == PixelSize(width: 360, height: 640))
+    }
+
+    @Test func leavesLandscapeClipsLandscape() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sample = try makeSample(in: directory, size: "1920x1080", seconds: 2, audio: false)
+        let transcoder = Transcoder(tools: tools)
+        let settings = EncodeSettings(resolution: .p720, keepAudio: false)
+        let output = directory.appending(path: settings.outputFileName(for: sample))
+
+        let result = try runAsync { () -> VideoInfo in
+            let info = try await transcoder.probe(sample)
+            for try await _ in transcoder.transcode(
+                input: sample, output: output, settings: settings, info: info
+            ) {}
+            return try await transcoder.probe(output)
+        }
+
+        #expect(result.displaySize == PixelSize(width: 1280, height: 720))
+    }
+
     @Test func reportsAnErrorForAFileFFmpegCannotRead() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
