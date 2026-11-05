@@ -27,8 +27,7 @@ jobs:
         run: |
           XCODE="$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)"
           sudo xcode-select -s "$XCODE"
-          xcodebuild -version
-          swift --version
+          echo "::notice::$(basename "$XCODE"): $(swift --version 2>&1 | head -1)"
 
       - name: Install ffmpeg and Ghostscript
         env:
@@ -38,7 +37,16 @@ jobs:
 
       # Includes the integration tests, which convert real files with both tools.
       - name: Test
-        run: swift test
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      # Raw logs need a signed-in viewer; annotations show on the run page.
+      - name: Surface failures on the run page
+        if: failure()
+        run: |
+          grep -E "error:|✘ Test .*(failed|recorded an issue)" "$RUNNER_TEMP/test.log" | head -40 \
+            | sed -e 's/%/%25/g' | while IFS= read -r line; do echo "::error::$line"; done
 
       - name: Build the app
         run: |
