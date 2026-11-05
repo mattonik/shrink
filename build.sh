@@ -17,6 +17,19 @@ APP="$DEST/$APP_NAME.app"
 echo "==> Building release binary"
 swift build -c release
 
+# A running instance keeps its old executable mapped in memory, so replacing
+# the bundle on disk changes nothing until the app is restarted. Quitting here
+# stops a stale window from quietly serving up the previous build.
+if pgrep -x "$APP_NAME" >/dev/null; then
+  echo "==> Quitting running $APP_NAME"
+  osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
+  for _ in $(seq 1 20); do
+    pgrep -x "$APP_NAME" >/dev/null || break
+    sleep 0.25
+  done
+  pgrep -x "$APP_NAME" >/dev/null && echo "    (still running — close it by hand)" || true
+fi
+
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
