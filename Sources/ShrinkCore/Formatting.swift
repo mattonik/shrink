@@ -8,6 +8,10 @@ public func isVideoFile(_ url: URL) -> Bool {
     videoFileExtensions.contains(url.pathExtension.lowercased())
 }
 
+public func isPDFFile(_ url: URL) -> Bool {
+    url.pathExtension.lowercased() == "pdf"
+}
+
 /// `65` -> `1:05`, `3725` -> `1:02:05`.
 public func formatDuration(_ seconds: Double) -> String {
     guard seconds.isFinite, seconds >= 0 else { return "—" }

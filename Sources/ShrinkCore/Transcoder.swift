@@ -92,6 +92,15 @@ public struct ToolPaths: Sendable {
         return ToolPaths(ffmpeg: ffmpeg, ffprobe: ffprobe)
     }
 
+    /// Ghostscript is optional: without it videos still work and PDFs report
+    /// how to install it. Found the same way as ffmpeg, for the same reason.
+    public static func locateGhostscript(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        let pathDirectories = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
+        return firstExecutable(named: "gs", in: searchDirectories + pathDirectories)
+    }
+
     static func firstExecutable(named name: String, in directories: [String]) -> URL? {
         let fileManager = FileManager.default
         for directory in directories where !directory.isEmpty {
@@ -122,7 +131,7 @@ public struct Transcoder: Sendable {
     }
 
     public func probe(_ url: URL) async throws -> VideoInfo {
-        let output = try await runCapturingOutput(
+        let output = try await runCollectingOutput(
             executable: tools.ffprobe,
             arguments: [
                 "-v", "error", "-print_format", "json", "-show_format", "-show_streams", url.path,
@@ -190,90 +199,27 @@ public struct Transcoder: Sendable {
         let duration = info.durationSeconds
 
         return AsyncThrowingStream { continuation in
-            let process = Process()
-            process.executableURL = executable
-            process.arguments = arguments
-            let progressPipe = Pipe()
-            let errorPipe = Pipe()
-            process.standardOutput = progressPipe
-            process.standardError = errorPipe
-            process.standardInput = FileHandle.nullDevice
-
             let task = Task {
                 do {
-                    try process.run()
-                } catch {
-                    continuation.finish(throwing: TranscodeError.failed(error.localizedDescription))
-                    return
-                }
-
-                // Drain stderr concurrently: ffmpeg blocks once a pipe buffer
-                // fills, so an unread error log would hang the conversion.
-                let errorText = Task {
-                    (try? errorPipe.fileHandleForReading.readToEnd())
-                        .flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                }
-
-                for try await line in progressPipe.fileHandleForReading.bytes.lines {
-                    guard let microseconds = parseProgressMicroseconds(line: line), duration > 0
-                    else { continue }
-                    let fraction = Double(microseconds) / 1_000_000 / duration
-                    continuation.yield(min(1, max(0, fraction)))
-                }
-
-                process.waitUntilExit()
-                let stderr = await errorText.value
-
-                if Task.isCancelled {
-                    continuation.finish(throwing: CancellationError())
-                } else if process.terminationStatus == 0 {
+                    let result = try await runStreamingLines(
+                        executable: executable,
+                        arguments: arguments
+                    ) { line in
+                        guard let microseconds = parseProgressMicroseconds(line: line), duration > 0
+                        else { return }
+                        let fraction = Double(microseconds) / 1_000_000 / duration
+                        continuation.yield(min(1, max(0, fraction)))
+                    }
+                    guard result.status == 0 else {
+                        throw TranscodeError.failed(result.failureMessage(tool: "ffmpeg"))
+                    }
                     continuation.yield(1)
                     continuation.finish()
-                } else {
-                    let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                    continuation.finish(
-                        throwing: TranscodeError.failed(
-                            detail.isEmpty
-                                ? "ffmpeg exited with code \(process.terminationStatus)" : detail
-                        )
-                    )
+                } catch {
+                    continuation.finish(throwing: error)
                 }
             }
-
-            continuation.onTermination = { reason in
-                if case .cancelled = reason, process.isRunning {
-                    process.terminate()
-                }
-                task.cancel()
-            }
+            continuation.onTermination = { _ in task.cancel() }
         }
-    }
-
-    private func runCapturingOutput(executable: URL, arguments: [String]) async throws -> Data {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
-
-        let data = try outputPipe.fileHandleForReading.readToEnd() ?? Data()
-        let errorData = try errorPipe.fileHandleForReading.readToEnd() ?? Data()
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
-            let message =
-                String(data: errorData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            throw TranscodeError.failed(
-                message.isEmpty
-                    ? "\(executable.lastPathComponent) exited with \(process.terminationStatus)"
-                    : message
-            )
-        }
-        return data
     }
 }
