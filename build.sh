@@ -17,7 +17,9 @@ APP="$DEST/$APP_NAME.app"
 
 # Releases are git tags (v1.2.0). CI passes the tag in; a local build reports
 # the latest tag it contains, so it is only offered releases made after it.
-VERSION="${SHRINK_VERSION:-$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//')}"
+# `|| true` matters: with no tag yet, git describe fails, and under pipefail
+# that failure would end the script silently.
+VERSION="${SHRINK_VERSION:-$({ git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true; } | sed 's/^v//')}"
 VERSION="${VERSION:-0.0.0}"
 BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 

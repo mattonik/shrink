@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a release halfway through notarisation.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # tags, for the version build.sh reports
+
+      - name: Use the newest Xcode on the runner
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          swift --version
+
+      - name: Install ffmpeg and Ghostscript
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: brew install ffmpeg ghostscript
+
+      # Includes the integration tests, which convert real files with both tools.
+      - name: Test
+        run: swift test
+
+      - name: Build the app
+        run: |
+          ./build.sh dist
+          # upload-artifact drops the executable bit, so ship a zip.
+          ditto -c -k --keepParent dist/Shrink.app dist/Shrink-unsigned.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Shrink-unsigned
+          path: dist/Shrink-unsigned.zip
+          retention-days: 14
+
+  release:
+    name: Sign, notarise and publish
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-15
+    permissions:
+      contents: write # create the GitHub release
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Use the newest Xcode on the runner
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)"
+
+      - name: Read release settings
+        run: |
+          source release.conf
+          if [ -z "$TEAM_ID" ]; then
+            echo "::error::TEAM_ID is empty in release.conf — the updater would refuse every release."
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must look like v1.2.3, got $GITHUB_REF_NAME"
+            exit 1
+          fi
+          echo "TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+          echo "SHRINK_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # A throwaway keychain, deleted at the end, holds the certificate only
+      # for this job.
+      - name: Import the Developer ID certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "Developer ID Application" | grep "($TEAM_ID)" | head -1 | sed -E 's/.*"(.*)"/\1/')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::DEVELOPER_ID_P12_BASE64 has no Developer ID Application certificate for team $TEAM_ID"
+            exit 1
+          fi
+          echo "SHRINK_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build and sign
+        run: ./build.sh dist
+
+      - name: Notarise and staple
+        env:
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          KEY="$RUNNER_TEMP/notary.p8"
+          echo "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$KEY"
+          ditto -c -k --keepParent dist/Shrink.app "$RUNNER_TEMP/notarize.zip"
+          RESULT="$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m --output-format json)"
+          echo "$RESULT"
+          # notarytool can exit 0 for a rejected submission, so read the verdict.
+          if [ "$(echo "$RESULT" | jq -r .status)" != "Accepted" ]; then
+            xcrun notarytool log "$(echo "$RESULT" | jq -r .id)" \
+              --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" || true
+            rm -f "$KEY"
+            echo "::error::Notarisation was not accepted"
+            exit 1
+          fi
+          rm -f "$KEY"
+          xcrun stapler staple dist/Shrink.app
+          xcrun stapler validate dist/Shrink.app
+
+      # The same verifier the app runs before installing an update, against
+      # this exact build — a release the updater would refuse never ships.
+      - name: Check the updater accepts this build
+        env:
+          SHRINK_VERIFY_APP: ${{ github.workspace }}/dist/Shrink.app
+          SHRINK_TEAM_ID: ${{ env.TEAM_ID }}
+        run: swift test --filter acceptsTheReleaseBuild
+
+      - name: Package
+        run: |
+          ditto -c -k --keepParent dist/Shrink.app dist/Shrink.zip
+          (cd dist && shasum -a 256 Shrink.zip > Shrink.zip.sha256)
+          cat dist/Shrink.zip.sha256
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/Shrink.zip dist/Shrink.zip.sha256 \
+            --title "Shrink $SHRINK_VERSION" --generate-notes --verify-tag
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
