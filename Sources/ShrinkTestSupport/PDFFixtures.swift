@@ -4,13 +4,13 @@ import PDFKit
 
 /// Builds real PDF files for the integration tests, each standing in for a
 /// kind of document Shrink has to treat differently.
-enum PDFFixtures {
-    struct FixtureError: Error {}
+public enum PDFFixtures {
+    public struct FixtureError: Error {}
 
     /// Pages that each hold a distinct high-resolution noise image: about
     /// 246 dpi on the page, so every preset downsamples it, and different on
     /// every page so Ghostscript cannot deduplicate its way through the file.
-    static func imageHeavy(at url: URL, pages: Int = 1, pixels: Int = 1600) throws {
+    public static func imageHeavy(at url: URL, pages: Int = 1, pixels: Int = 1600) throws {
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         guard let context = CGContext(url as CFURL, mediaBox: &mediaBox, nil) else {
             throw FixtureError()
@@ -23,7 +23,7 @@ enum PDFFixtures {
         context.closePDF()
     }
 
-    static func withFormField(at url: URL) throws {
+    public static func withFormField(at url: URL) throws {
         let document = PDFDocument()
         let page = PDFPage()
         document.insert(page, at: 0)
@@ -37,7 +37,7 @@ enum PDFFixtures {
         guard document.write(to: url) else { throw FixtureError() }
     }
 
-    static func passwordProtected(at url: URL) throws {
+    public static func passwordProtected(at url: URL) throws {
         try imageHeavy(at: url, pixels: 200)
         guard let document = PDFDocument(url: url),
             document.write(
@@ -49,7 +49,7 @@ enum PDFFixtures {
     /// A one-page document with a filled signature field. The signature value
     /// is a placeholder — detection only cares that a signature dictionary with
     /// a `/ByteRange` exists, which is what every real signature carries.
-    static func signed(at url: URL) throws {
+    public static func signed(at url: URL) throws {
         try handBuilt(
             at: url,
             objects: [
@@ -62,7 +62,7 @@ enum PDFFixtures {
     }
 
     /// Writes a PDF from raw object bodies with a correct cross-reference table.
-    static func handBuilt(at url: URL, objects: [String]) throws {
+    public static func handBuilt(at url: URL, objects: [String]) throws {
         var body = "%PDF-1.7\n"
         var offsets: [Int] = []
         for (index, object) in objects.enumerated() {
@@ -80,7 +80,7 @@ enum PDFFixtures {
 
     /// Breaks the trailer pointer so a reader has to rebuild the xref table by
     /// scanning — recoverable damage of the kind Ghostscript quietly repairs.
-    static func damageCrossReference(of url: URL) throws {
+    public static func damageCrossReference(of url: URL) throws {
         var data = try Data(contentsOf: url)
         guard let marker = data.range(of: Data("startxref".utf8), options: .backwards) else {
             throw FixtureError()

@@ -7,10 +7,10 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if model.tools == nil {
-                MissingToolsView(model: model)
-            } else {
+            if model.hasAnyTool {
                 mainLayout
+            } else {
+                MissingToolsView(model: model)
             }
         }
     }
@@ -19,7 +19,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             fileArea
             Divider()
-            SettingsPanel(settings: $model.settings)
+            SettingsPanel(model: model)
                 .disabled(model.isConverting)
             Divider()
             bottomBar
@@ -60,7 +60,7 @@ struct ContentView: View {
 
     private var bottomBar: some View {
         HStack(spacing: 12) {
-            Button("Add Videos…") { model.chooseFiles() }
+            Button("Add Files…") { model.chooseFiles() }
                 .disabled(model.isConverting)
 
             if model.hasFinishedItems && !model.isConverting {
@@ -88,21 +88,20 @@ struct ContentView: View {
     }
 
     private var statusText: String {
-        let pending = model.items.filter(\.isPending).count
-        if model.isConverting {
-            let done = model.items.filter { if case .done = $0.state { true } else { false } }.count
-            return "Converting \(done + 1) of \(done + 1 + pending)…"
+        if model.isConverting, let position = model.runPosition {
+            return "Converting \(position.index) of \(position.total)…"
         }
-        let totalSaved = model.items.reduce(into: (source: Int64(0), output: Int64(0))) { totals, item in
-            if case .done(_, let byteCount) = item.state, let info = item.info {
-                totals.source += info.byteCount
+        let totals = model.items.reduce(into: (source: Int64(0), output: Int64(0))) { totals, item in
+            if case .done(_, let byteCount) = item.state, let source = item.sourceByteCount {
+                totals.source += source
                 totals.output += byteCount
             }
         }
-        if let percent = savingsPercent(source: totalSaved.source, output: totalSaved.output) {
-            return "Saved \(formatBytes(totalSaved.source - totalSaved.output)) · \(percent)% smaller"
+        if let percent = savingsPercent(source: totals.source, output: totals.output) {
+            return "Saved \(formatBytes(totals.source - totals.output)) · \(percent)% smaller"
         }
-        return pending > 0 ? "\(pending) video\(pending == 1 ? "" : "s") ready" : ""
+        let pending = model.items.filter { $0.isPending && $0.source != nil }.count
+        return pending > 0 ? "\(pending) file\(pending == 1 ? "" : "s") ready" : ""
     }
 }
 
@@ -112,9 +111,9 @@ private struct EmptyStateView: View {
             Image(systemName: "arrow.down.circle.dotted")
                 .font(.system(size: 38, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text("Drop videos here")
+            Text("Drop videos or PDFs here")
                 .font(.title3)
-            Text("MP4, MOV, WebM, MKV and friends")
+            Text("MP4, MOV, WebM, MKV and PDF")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -127,6 +126,10 @@ private struct ItemRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            Image(systemName: item.kind == .pdf ? "doc.richtext" : "film")
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.url.lastPathComponent)
                     .fontWeight(.medium)
@@ -148,10 +151,20 @@ private struct ItemRow: View {
                 .font(.caption)
                 .foregroundStyle(.red)
                 .lineLimit(2)
+        case .skipped(let reason):
+            Text(reason)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
         case .converting(let fraction):
             ProgressView(value: fraction)
                 .progressViewStyle(.linear)
                 .frame(maxWidth: 240)
+        case .done where item.warning != nil:
+            Label(item.warning ?? "", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .lineLimit(2)
         default:
             Text(sourceSummary)
                 .font(.caption)
@@ -161,14 +174,21 @@ private struct ItemRow: View {
     }
 
     private var sourceSummary: String {
-        guard let info = item.info else { return "Reading…" }
-        var parts = [
-            "\(info.displaySize.width)×\(info.displaySize.height)",
-            formatDuration(info.durationSeconds),
-            formatBytes(info.byteCount),
-        ]
-        if !info.hasAudio { parts.append("no sound") }
-        return parts.joined(separator: " · ")
+        switch item.source {
+        case nil:
+            return "Reading…"
+        case .video(let info):
+            var parts = [
+                "\(info.displaySize.width)×\(info.displaySize.height)",
+                formatDuration(info.durationSeconds),
+                formatBytes(info.byteCount),
+            ]
+            if !info.hasAudio { parts.append("no sound") }
+            return parts.joined(separator: " · ")
+        case .pdf(let info):
+            let pages = "\(info.pageCount) page\(info.pageCount == 1 ? "" : "s")"
+            return "\(pages) · \(formatBytes(info.byteCount))"
+        }
     }
 
     @ViewBuilder private var trailing: some View {
@@ -196,8 +216,8 @@ private struct ItemRow: View {
                     Text(formatBytes(byteCount))
                         .font(.callout)
                         .monospacedDigit()
-                    if let info = item.info,
-                        let percent = savingsPercent(source: info.byteCount, output: byteCount)
+                    if let source = item.sourceByteCount,
+                        let percent = savingsPercent(source: source, output: byteCount)
                     {
                         Text("−\(percent)%")
                             .font(.caption)
@@ -214,6 +234,11 @@ private struct ItemRow: View {
                 .help("Show in Finder")
             }
 
+        case .skipped:
+            Text("Kept original")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
         case .failed:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -227,30 +252,77 @@ private struct ItemRow: View {
 }
 
 private struct SettingsPanel: View {
-    @Binding var settings: EncodeSettings
+    @Bindable var model: AppModel
 
+    /// Section labels only earn their space when both kinds are on screen.
+    private var showsLabels: Bool { model.hasVideos && model.hasPDFs }
+    private var showsVideo: Bool { model.hasVideos || !model.hasPDFs }
+
+    /// One grid for both sections, so the picker labels right-align and the
+    /// pickers share a left edge however long each label is.
     var body: some View {
-        HStack(alignment: .top, spacing: 24) {
-            VStack(alignment: .leading, spacing: 10) {
-                Picker("Resolution", selection: $settings.resolution) {
-                    ForEach(ResolutionPreset.allCases) { Text($0.label).tag($0) }
+        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 10) {
+            if showsVideo {
+                GridRow {
+                    if showsLabels { SectionLabel(title: "Video", systemImage: "film") }
+                    Text("Resolution").gridColumnAlignment(.trailing)
+                    Picker("Resolution", selection: $model.settings.resolution) {
+                        ForEach(ResolutionPreset.allCases) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 170, alignment: .leading)
+                    Toggle("Keep sound", isOn: $model.settings.keepAudio)
+                        .padding(.leading, 12)
                 }
-                Picker("Quality", selection: $settings.quality) {
-                    ForEach(Quality.allCases) { Text($0.label).tag($0) }
+                GridRow {
+                    if showsLabels { Color.clear.gridCellUnsizedAxes([.horizontal, .vertical]) }
+                    Text("Quality")
+                    Picker("Quality", selection: $model.settings.quality) {
+                        ForEach(Quality.allCases) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 170, alignment: .leading)
+                    Toggle("HEVC (smaller files)", isOn: $model.settings.useHEVC)
+                        .help("H.265: roughly 30–50% smaller, but older players and some Windows PCs can't play it")
+                        .padding(.leading, 12)
                 }
             }
-            .frame(maxWidth: 260)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle("Keep sound", isOn: $settings.keepAudio)
-                Toggle("HEVC (smaller, needs a recent player)", isOn: $settings.useHEVC)
+            if showsLabels {
+                Divider().gridCellColumns(4).padding(.vertical, 2)
             }
-            .toggleStyle(.checkbox)
-
-            Spacer(minLength: 0)
+            if model.hasPDFs {
+                GridRow {
+                    if showsLabels { SectionLabel(title: "PDF", systemImage: "doc.richtext") }
+                    Text("Images")
+                    Picker("Images", selection: $model.pdfQuality) {
+                        ForEach(PDFQuality.allCases) { Text($0.label).tag($0) }
+                    }
+                    .labelsHidden()
+                    .frame(width: 170, alignment: .leading)
+                    Text("Signed, password-protected and form PDFs are left untouched.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 12)
+                }
+            }
         }
+        .toggleStyle(.checkbox)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+}
+
+private struct SectionLabel: View {
+    let title: String
+    let systemImage: String
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(.secondary)
+            .frame(width: 70, alignment: .leading)
     }
 }
 
@@ -262,12 +334,12 @@ private struct MissingToolsView: View {
             Image(systemName: "wrench.and.screwdriver")
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("ffmpeg not found")
+            Text("ffmpeg and Ghostscript not found")
                 .font(.title3)
-            Text("Shrink uses ffmpeg to convert videos. Install it, then check again:")
+            Text("Shrink uses ffmpeg for videos and Ghostscript for PDFs. Install them, then check again:")
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Text("brew install ffmpeg")
+            Text("brew install ffmpeg ghostscript")
                 .font(.system(.callout, design: .monospaced))
                 .textSelection(.enabled)
                 .padding(.horizontal, 12)

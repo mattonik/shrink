@@ -2,6 +2,7 @@ import Foundation
 import Testing
 
 @testable import ShrinkCore
+import ShrinkTestSupport
 
 /// Exercises the real ffmpeg pipeline: process launch, progress parsing on
 /// stdout, stderr draining, and cancellation. The unit tests only cover the
@@ -10,7 +11,6 @@ import Testing
 struct TranscodeIntegrationTests {
     let tools = ToolPaths.locate()!
 
-    /// Generates a real test clip with ffmpeg's lavfi source.
     func makeSample(
         in directory: URL,
         name: String = "sample.mp4",
@@ -19,40 +19,9 @@ struct TranscodeIntegrationTests {
         audio: Bool = true,
         pattern: String = "testsrc"
     ) throws -> URL {
-        let output = directory.appending(path: name)
-        let process = Process()
-        process.executableURL = tools.ffmpeg
-        var args = [
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "\(pattern)=size=\(size):rate=25:duration=\(seconds)",
-        ]
-        if audio {
-            args += ["-f", "lavfi", "-i", "sine=frequency=440:duration=\(seconds)", "-c:a", "aac"]
-        }
-        args += ["-c:v", "libx264", "-crf", "18", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
-        process.arguments = args + [output.path]
-        try process.run()
-        process.waitUntilExit()
-        return output
-    }
-
-    /// Two minutes of busy 1080p: about 12 s to encode on an M-series Mac and
-    /// longer on CI, so a process that ignores cancellation is still running
-    /// when the test looks. Looping a 10 s clip with stream copy makes it cheap.
-    func makeLongSample(in directory: URL) throws -> URL {
-        let clip = try makeSample(
-            in: directory, name: "clip.mp4", size: "1920x1080", seconds: 10, audio: false,
-            pattern: "testsrc2")
-        let output = directory.appending(path: "long.mp4")
-        let process = Process()
-        process.executableURL = tools.ffmpeg
-        process.arguments = [
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-stream_loop", "11", "-i", clip.path, "-c", "copy", output.path,
-        ]
-        try process.run()
-        process.waitUntilExit()
-        return output
+        try VideoFixtures.make(
+            ffmpeg: tools.ffmpeg, in: directory, name: name, size: size, seconds: seconds,
+            audio: audio, pattern: pattern)
     }
 
     func temporaryDirectory() throws -> URL {
@@ -225,7 +194,7 @@ struct TranscodeIntegrationTests {
     @Test func cancellingStopsFFmpeg() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let sample = try makeLongSample(in: directory)
+        let sample = try VideoFixtures.makeLong(ffmpeg: tools.ffmpeg, in: directory)
         let transcoder = Transcoder(tools: tools)
         let settings = EncodeSettings(resolution: .original, quality: .high)
         let output = directory.appending(path: settings.outputFileName(for: sample))

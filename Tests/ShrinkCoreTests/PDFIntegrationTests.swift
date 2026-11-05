@@ -3,6 +3,7 @@ import PDFKit
 import Testing
 
 @testable import ShrinkCore
+import ShrinkTestSupport
 
 /// Runs real Ghostscript against generated PDFs. The unit tests pin the
 /// argument strings; these prove what actually ends up on disk.
