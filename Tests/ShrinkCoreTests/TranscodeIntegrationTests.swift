@@ -1,0 +1,135 @@
+import Foundation
+import Testing
+
+@testable import ShrinkCore
+
+/// Exercises the real ffmpeg pipeline: process launch, progress parsing on
+/// stdout, stderr draining, and cancellation. The unit tests only cover the
+/// argument strings, so this is what proves a conversion actually runs.
+@Suite(.enabled(if: ToolPaths.locate() != nil, "requires ffmpeg on this machine"))
+struct TranscodeIntegrationTests {
+    let tools = ToolPaths.locate()!
+
+    /// Generates a real test clip with ffmpeg's lavfi source.
+    func makeSample(
+        in directory: URL,
+        name: String = "sample.mp4",
+        size: String = "640x360",
+        seconds: Int = 3,
+        audio: Bool = true
+    ) throws -> URL {
+        let output = directory.appending(path: name)
+        let process = Process()
+        process.executableURL = tools.ffmpeg
+        var args = [
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=\(size):rate=25:duration=\(seconds)",
+        ]
+        if audio {
+            args += ["-f", "lavfi", "-i", "sine=frequency=440:duration=\(seconds)", "-c:a", "aac"]
+        }
+        args += ["-c:v", "libx264", "-crf", "18", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+        process.arguments = args + [output.path]
+        try process.run()
+        process.waitUntilExit()
+        return output
+    }
+
+    func temporaryDirectory() throws -> URL {
+        let directory = URL.temporaryDirectory.appending(path: "shrink-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    @Test func probesARealFile() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sample = try makeSample(in: directory)
+
+        let info = try runAsync { try await Transcoder(tools: tools).probe(sample) }
+
+        #expect(info.size == PixelSize(width: 640, height: 360))
+        #expect(abs(info.durationSeconds - 3) < 0.3)
+        #expect(info.hasAudio)
+        #expect(info.byteCount > 0)
+    }
+
+    @Test func transcodesDownscalesAndReportsProgress() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sample = try makeSample(in: directory, size: "1280x720", seconds: 3)
+        let transcoder = Transcoder(tools: tools)
+        let settings = EncodeSettings(resolution: .p480, quality: .balanced, keepAudio: true)
+        let output = directory.appending(path: settings.outputFileName(for: sample))
+
+        let fractions = try runAsync { () -> [Double] in
+            let info = try await transcoder.probe(sample)
+            var seen: [Double] = []
+            for try await fraction in transcoder.transcode(
+                input: sample, output: output, settings: settings, info: info
+            ) {
+                seen.append(fraction)
+            }
+            return seen
+        }
+
+        #expect(!fractions.isEmpty, "ffmpeg reported no progress")
+        #expect(fractions.allSatisfy { $0 >= 0 && $0 <= 1 })
+        #expect(fractions.last == 1)
+        #expect(FileManager.default.fileExists(atPath: output.path))
+
+        // The converted file is genuinely 480p and genuinely smaller.
+        let result = try runAsync { try await transcoder.probe(output) }
+        #expect(result.size == PixelSize(width: 852, height: 480))
+        #expect(result.hasAudio)
+        let source = try runAsync { try await transcoder.probe(sample) }
+        #expect(result.byteCount < source.byteCount)
+    }
+
+    @Test func muteProducesAFileWithNoAudioTrack() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sample = try makeSample(in: directory, seconds: 2)
+        let transcoder = Transcoder(tools: tools)
+        let settings = EncodeSettings(resolution: .original, keepAudio: false)
+        let output = directory.appending(path: settings.outputFileName(for: sample))
+
+        let result = try runAsync { () -> VideoInfo in
+            let info = try await transcoder.probe(sample)
+            for try await _ in transcoder.transcode(
+                input: sample, output: output, settings: settings, info: info
+            ) {}
+            return try await transcoder.probe(output)
+        }
+
+        #expect(!result.hasAudio)
+    }
+
+    @Test func reportsAnErrorForAFileFFmpegCannotRead() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let broken = directory.appending(path: "broken.mp4")
+        try Data("this is not a video".utf8).write(to: broken)
+
+        #expect(throws: (any Error).self) {
+            try runAsync { try await Transcoder(tools: tools).probe(broken) }
+        }
+    }
+}
+
+/// Bridges an async call into a synchronous test body.
+private func runAsync<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) throws -> T
+{
+    let box = ResultBox<T>()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        do { box.value = .success(try await operation()) } catch { box.value = .failure(error) }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return try box.value!.get()
+}
+
+private final class ResultBox<T: Sendable>: @unchecked Sendable {
+    var value: Result<T, any Error>?
+}
