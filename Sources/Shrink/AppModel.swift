@@ -84,10 +84,12 @@ final class AppModel {
     /// Adds dropped or chosen files, skipping unsupported and duplicate
     /// entries, then reads each one's details in the background.
     func add(urls: [URL]) {
-        let existing = Set(items.map(\.url.standardizedFileURL))
+        // Duplicates within one batch too: Open With can deliver a file twice,
+        // and a second row for it would never be read.
+        var seen = Set(items.map(\.url.standardizedFileURL))
         let accepted = urls
             .map(\.standardizedFileURL)
-            .filter { (isVideoFile($0) || isPDFFile($0)) && !existing.contains($0) }
+            .filter { (isVideoFile($0) || isPDFFile($0)) && seen.insert($0).inserted }
         guard !accepted.isEmpty else { return }
 
         for url in accepted {
@@ -153,8 +155,13 @@ final class AppModel {
         let videoSettings = settings
         let pdfQuality = pdfQuality
         isConverting = true
+        // Without this, a Mac on battery idles to sleep halfway through a long
+        // batch and the conversion just stops until someone wakes it.
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiated, reason: "Converting files")
         conversionTask = Task {
             defer {
+                ProcessInfo.processInfo.endActivity(activity)
                 isConverting = false
                 runPosition = nil
                 conversionTask = nil
@@ -166,11 +173,18 @@ final class AppModel {
                 }
                 runPosition = (index + 1, pending.count)
                 guard let item = items.first(where: { $0.id == id }) else { continue }
+                let folder = item.url.deletingLastPathComponent()
                 switch item.source {
                 case .video(let info):
-                    if let tools { await convertVideo(item, info: info, settings: videoSettings, tools: tools) }
+                    guard let tools else { continue }
+                    let output = folder.appending(path: videoSettings.outputFileName(for: item.url))
+                    await run(id, Transcoder(tools: tools).transcode(
+                        input: item.url, output: output, settings: videoSettings, info: info))
                 case .pdf:
-                    if let ghostscript { await compressPDF(item, quality: pdfQuality, ghostscript: ghostscript) }
+                    guard let ghostscript else { continue }
+                    let output = folder.appending(path: pdfQuality.outputFileName(for: item.url))
+                    await run(id, PDFCompressor(ghostscript: ghostscript).compress(
+                        input: item.url, output: output, quality: pdfQuality))
                 case nil:
                     break
                 }
@@ -182,87 +196,50 @@ final class AppModel {
         conversionTask?.cancel()
     }
 
-    private func convertVideo(
-        _ item: Item, info: VideoInfo, settings: EncodeSettings, tools: ToolPaths
-    ) async {
-        let id = item.id
-        let output = item.url
-            .deletingLastPathComponent()
-            .appending(path: settings.outputFileName(for: item.url))
-
-        update(id) { $0.state = .converting(0) }
-        do {
-            let stream = Transcoder(tools: tools).transcode(
-                input: item.url,
-                output: output,
-                settings: settings,
-                info: info
-            )
-            for try await fraction in stream {
-                update(id) { $0.state = .converting(fraction) }
-            }
-            // A cancelled stream can end without throwing, so confirm before
-            // reporting success — otherwise a half-written file looks finished.
-            try Task.checkCancellation()
-
-            let byteCount =
-                (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap(Int64.init)
-                ?? 0
-            update(id) { $0.state = .done(output: output, byteCount: byteCount) }
-        } catch is CancellationError {
-            discardPartialVideo(at: output)
-            update(id) { $0.state = .cancelled }
-        } catch {
-            discardPartialVideo(at: output)
-            update(id) { $0.state = .failed(error.localizedDescription) }
-        }
+    /// Cancels the run and returns once it has wound down, so quitting can
+    /// wait for the tools to be stopped.
+    func cancelAndWait() async {
+        guard let task = conversionTask else { return }
+        task.cancel()
+        await task.value
     }
 
-    /// No cleanup here on purpose: the compressor only writes to `output` once
-    /// a result is kept, so on cancel or failure whatever is at that path was
-    /// there before and belongs to the user.
-    private func compressPDF(_ item: Item, quality: PDFQuality, ghostscript: URL) async {
-        let id = item.id
-        let output = item.url
-            .deletingLastPathComponent()
-            .appending(path: quality.outputFileName(for: item.url))
-
+    /// Runs one conversion and records how it ended.
+    ///
+    /// No cleanup on cancel or failure, on purpose: ffmpeg and Ghostscript
+    /// write into a scratch folder and only a finished result reaches the
+    /// output path, so whatever is at that path then was there before and
+    /// belongs to the user.
+    private func run(_ id: UUID, _ events: AsyncThrowingStream<ConversionEvent, Error>) async {
         update(id) { $0.state = .converting(0) }
         do {
-            var outcome: PDFOutcome?
-            let stream = PDFCompressor(ghostscript: ghostscript)
-                .compress(input: item.url, output: output, quality: quality)
-            for try await event in stream {
+            var outcome: ConversionOutcome?
+            for try await event in events {
                 switch event {
                 case .progress(let fraction): update(id) { $0.state = .converting(fraction) }
                 case .finished(let result): outcome = result
                 }
             }
+            // A cancelled stream can end without throwing, so confirm before
+            // reporting success — otherwise a cancelled file shows as done.
             try Task.checkCancellation()
 
             switch outcome {
-            case .compressed(let url, let byteCount, let warning):
+            case .compressed(let output, let byteCount, let warning):
                 update(id) {
-                    $0.state = .done(output: url, byteCount: byteCount)
+                    $0.state = .done(output: output, byteCount: byteCount)
                     $0.warning = warning
                 }
             case .keptOriginal(let reason):
                 update(id) { $0.state = .skipped(reason) }
             case nil:
-                update(id) { $0.state = .failed("Ghostscript stopped without a result") }
+                update(id) { $0.state = .failed("The conversion stopped without a result") }
             }
         } catch is CancellationError {
             update(id) { $0.state = .cancelled }
         } catch {
             update(id) { $0.state = .failed(error.localizedDescription) }
         }
-    }
-
-    /// ffmpeg writes straight to its output and leaves a truncated MP4 behind
-    /// when killed or failing; removing it keeps a broken file from looking
-    /// like a real result.
-    private func discardPartialVideo(at url: URL) {
-        try? FileManager.default.removeItem(at: url)
     }
 
     private func update(_ id: UUID, _ mutate: (inout Item) -> Void) {

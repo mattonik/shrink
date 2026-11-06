@@ -67,10 +67,10 @@ import Testing
 }
 
 @Test func keepsOnlyResultsThatSaveAtLeastTenPercent() {
-    #expect(PDFCompressor.shouldKeep(outputBytes: 900, originalBytes: 1000))
-    #expect(!PDFCompressor.shouldKeep(outputBytes: 901, originalBytes: 1000))
-    #expect(!PDFCompressor.shouldKeep(outputBytes: 1200, originalBytes: 1000))
-    #expect(!PDFCompressor.shouldKeep(outputBytes: 0, originalBytes: 1000))
+    #expect(Savings.worthKeeping(outputBytes: 900, originalBytes: 1000))
+    #expect(!Savings.worthKeeping(outputBytes: 901, originalBytes: 1000))
+    #expect(!Savings.worthKeeping(outputBytes: 1200, originalBytes: 1000))
+    #expect(!Savings.worthKeeping(outputBytes: 0, originalBytes: 1000))
 }
 
 @Test func skipsDocumentsCompressionWouldDamage() {

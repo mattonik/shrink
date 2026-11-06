@@ -7,7 +7,10 @@ public struct VideoInfo: Equatable, Sendable {
     public var byteCount: Int64
     public var videoCodec: String
     public var hasAudio: Bool
-    public var hasSubtitles: Bool
+    /// Indexes of the subtitle streams MP4 can carry. Only text converts to
+    /// MP4's mov_text: picture subtitles from DVDs and Blu-rays make ffmpeg
+    /// refuse the whole conversion, so they are left out.
+    public var subtitleStreams: [Int]
     /// Display-matrix rotation in degrees; iPhone portrait clips carry -90.
     public var rotationDegrees: Int
 
@@ -17,7 +20,7 @@ public struct VideoInfo: Equatable, Sendable {
         byteCount: Int64,
         videoCodec: String,
         hasAudio: Bool,
-        hasSubtitles: Bool,
+        subtitleStreams: [Int] = [],
         rotationDegrees: Int = 0
     ) {
         self.size = size
@@ -25,7 +28,7 @@ public struct VideoInfo: Equatable, Sendable {
         self.byteCount = byteCount
         self.videoCodec = videoCodec
         self.hasAudio = hasAudio
-        self.hasSubtitles = hasSubtitles
+        self.subtitleStreams = subtitleStreams
         self.rotationDegrees = rotationDegrees
     }
 
@@ -137,10 +140,12 @@ public struct Transcoder: Sendable {
                 "-v", "error", "-print_format", "json", "-show_format", "-show_streams", url.path,
             ]
         )
-        let byteCount =
-            (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap(Int64.init) ?? 0
-        return try Self.parseProbe(output, byteCount: byteCount, name: url.lastPathComponent)
+        return try Self.parseProbe(output, byteCount: fileByteCount(url), name: url.lastPathComponent)
     }
+
+    /// Text subtitle formats, which convert to mov_text. Anything else, such as
+    /// dvd_subtitle or hdmv_pgs_subtitle, is a picture and can't.
+    static let textSubtitleCodecs: Set<String> = ["mov_text", "subrip", "srt", "ass", "ssa", "webvtt", "text"]
 
     static func parseProbe(_ data: Data, byteCount: Int64, name: String) throws -> VideoInfo {
         struct Payload: Decodable {
@@ -148,6 +153,7 @@ public struct Transcoder: Sendable {
                 let rotation: Double?
             }
             struct Stream: Decodable {
+                let index: Int?
                 let codec_type: String?
                 let codec_name: String?
                 let width: Int?
@@ -180,40 +186,69 @@ public struct Transcoder: Sendable {
             byteCount: byteCount,
             videoCodec: video.codec_name ?? "unknown",
             hasAudio: streams.contains { $0.codec_type == "audio" },
-            hasSubtitles: streams.contains { $0.codec_type == "subtitle" },
+            subtitleStreams: streams.compactMap { stream in
+                stream.codec_type == "subtitle" && textSubtitleCodecs.contains(stream.codec_name ?? "")
+                    ? stream.index : nil
+            },
             rotationDegrees: Int(rotation.rounded())
         )
     }
 
-    /// Streams conversion progress as a 0...1 fraction. Cancelling the consuming
-    /// task terminates ffmpeg. ffmpeg is launched directly with an argument
-    /// array and no shell, so filenames cannot be interpreted as commands.
+    /// Streams conversion progress as a 0...1 fraction, then the outcome.
+    /// Cancelling the consuming task terminates ffmpeg. ffmpeg is launched
+    /// directly with an argument array and no shell, so filenames cannot be
+    /// interpreted as commands.
+    ///
+    /// ffmpeg writes into a scratch folder, and the result only replaces
+    /// `output` once ffmpeg has finished it. Written in place, a failed or
+    /// cancelled run would leave a truncated file, or destroy one already there.
+    ///
+    /// As with PDFs, a result that saves less than `Savings.minimum` is thrown
+    /// away, because re-encoding an already compact video costs quality and can
+    /// even make it bigger. A copy with the sound taken out is always kept:
+    /// the original still has its sound, so it can't stand in for the copy.
     public func transcode(
         input: URL,
         output: URL,
         settings: EncodeSettings,
         info: VideoInfo
-    ) -> AsyncThrowingStream<Double, Error> {
-        let arguments = settings.arguments(input: input, output: output, info: info)
+    ) -> AsyncThrowingStream<ConversionEvent, Error> {
         let executable = tools.ffmpeg
         let duration = info.durationSeconds
+        let removesSound = !settings.keepAudio && info.hasAudio
 
         return AsyncThrowingStream { continuation in
             let task = Task {
+                var scratch: ScratchFolder?
+                defer { scratch?.remove() }
                 do {
+                    let folder = try ScratchFolder(for: output)
+                    scratch = folder
+                    // Same name, so ffmpeg still picks MP4 from the extension.
+                    let temporary = folder.url.appending(path: output.lastPathComponent)
                     let result = try await runStreamingLines(
                         executable: executable,
-                        arguments: arguments
+                        arguments: settings.arguments(input: input, output: temporary, info: info)
                     ) { line in
                         guard let microseconds = parseProgressMicroseconds(line: line), duration > 0
                         else { return }
                         let fraction = Double(microseconds) / 1_000_000 / duration
-                        continuation.yield(min(1, max(0, fraction)))
+                        continuation.yield(.progress(min(1, max(0, fraction))))
                     }
                     guard result.status == 0 else {
                         throw TranscodeError.failed(result.failureMessage(tool: "ffmpeg"))
                     }
-                    continuation.yield(1)
+                    let outputBytes = fileByteCount(temporary)
+                    guard removesSound || Savings.worthKeeping(outputBytes: outputBytes, originalBytes: info.byteCount)
+                    else {
+                        let reason = Savings.keptOriginalReason(outputBytes: outputBytes, originalBytes: info.byteCount)
+                        continuation.yield(.finished(.keptOriginal(reason: reason)))
+                        continuation.finish()
+                        return
+                    }
+                    try ScratchFolder.commit(temporary, to: output)
+                    continuation.yield(.progress(1))
+                    continuation.yield(.finished(.compressed(output: output, byteCount: outputBytes, warning: nil)))
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

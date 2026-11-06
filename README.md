@@ -59,6 +59,11 @@ For screen recordings, **720p + Balanced** is usually the sweet spot: text stays
 readable and files come out several times smaller. Leave **HEVC off** if you are
 sending the file to someone and do not know what they will open it with.
 
+A video that is already compact can come out barely smaller, or even bigger,
+and the re-encode still costs quality. So, as with PDFs, **a result that saves
+less than 10% is thrown away** and the row says "Kept original". A copy with the
+sound turned off is always kept, because the original still has its sound.
+
 ### PDFs
 
 `report.pdf` becomes `report-ebook.pdf`. The **Images** preset sets the
@@ -81,7 +86,13 @@ with a warning to check it before sending it on.
 
 Conversions run one at a time. x264 and Ghostscript already use the machine
 well, so a queue finishes sooner than running them all at once. **Cancel** stops
-the current file and leaves nothing half-written behind.
+the current file and leaves nothing half-written behind. A file that already has
+the output's name is only ever replaced by a finished result, so a cancelled or
+failed run leaves it alone.
+
+Closing the window mid-run keeps Shrink converting, and the Dock icon brings the
+window back. Quitting mid-run asks first, then stops the current file properly.
+While converting, Shrink keeps the Mac from going to sleep on its own.
 
 ## Updates
 
@@ -177,7 +188,8 @@ every frame hits the same quality target, which suits screen recordings where
 long stretches barely change. The app also:
 
 - refuses to upscale, and rounds both axes to even numbers so `yuv420p` chroma
-  subsampling is valid
+  subsampling is valid. That includes a size it keeps: a recording of part of
+  the screen can be 1437×899, and x264 refuses odd sides outright.
 - reads the rotation from a file's display matrix and sizes from the dimensions
   you actually see. Phones store portrait video as landscape frames plus a 90°
   flag, and ffmpeg applies that rotation before any filter runs, so sizing from
@@ -185,7 +197,9 @@ long stretches barely change. The app also:
 - tags HEVC output as `hvc1`, without which QuickTime and Safari will not play it
 - writes `+faststart` so the file can start playing before it has fully
   downloaded
-- keeps any soft subtitle track that the source carried
+- keeps text subtitle tracks the source carried, such as SRT or WebVTT. The
+  picture subtitles on DVDs and Blu-rays can't become MP4 text, so those are
+  left out rather than failing the whole file.
 
 **PDF:** Ghostscript's `pdfwrite` with `-dPDFSETTINGS` presets, plus:
 

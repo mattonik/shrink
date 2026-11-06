@@ -72,21 +72,9 @@ public struct PDFInfo: Equatable, Sendable {
     }
 }
 
-public enum PDFOutcome: Equatable, Sendable {
-    case compressed(output: URL, byteCount: Int64, warning: String?)
-    /// Nothing was written; the reason says why the original is the answer.
-    case keptOriginal(reason: String)
-}
-
-public enum PDFEvent: Equatable, Sendable {
-    case progress(Double)
-    case finished(PDFOutcome)
-}
-
 public enum PDFInspector {
     public static func inspect(_ url: URL) throws -> PDFInfo {
-        let byteCount =
-            (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap(Int64.init) ?? 0
+        let byteCount = fileByteCount(url)
         guard let document = PDFDocument(url: url) else {
             throw TranscodeError.failed("\(url.lastPathComponent) is not a readable PDF")
         }
@@ -127,11 +115,6 @@ public func parseGhostscriptPage(line: String) -> Int? {
 public struct PDFCompressor: Sendable {
     public let ghostscript: URL
 
-    /// Results saving less than this are thrown away. A Word export typically
-    /// shrinks 1–2%, which is not worth a rewritten document that may have lost
-    /// its accessibility tagging along the way.
-    public static let minimumSavings = 0.10
-
     public init(ghostscript: URL) {
         self.ghostscript = ghostscript
     }
@@ -169,10 +152,6 @@ public struct PDFCompressor: Sendable {
         return "Ghostscript had to repair this PDF (\(detail ?? "damaged file")) — check the result"
     }
 
-    static func shouldKeep(outputBytes: Int64, originalBytes: Int64) -> Bool {
-        outputBytes > 0 && Double(outputBytes) <= Double(originalBytes) * (1 - minimumSavings)
-    }
-
     /// Compresses `input` into `output`, streaming page progress.
     ///
     /// Ghostscript writes to a temporary file first, and the result only
@@ -182,14 +161,13 @@ public struct PDFCompressor: Sendable {
         input: URL,
         output: URL,
         quality: PDFQuality
-    ) -> AsyncThrowingStream<PDFEvent, Error> {
+    ) -> AsyncThrowingStream<ConversionEvent, Error> {
         let ghostscript = ghostscript
 
         return AsyncThrowingStream { continuation in
             let task = Task {
-                let fileManager = FileManager.default
-                var scratch: URL?
-                defer { if let scratch { try? fileManager.removeItem(at: scratch) } }
+                var scratch: ScratchFolder?
+                defer { scratch?.remove() }
 
                 do {
                     let info = try PDFInspector.inspect(input)
@@ -199,16 +177,9 @@ public struct PDFCompressor: Sendable {
                         return
                     }
 
-                    // Same volume as the destination where possible, so the
-                    // final move is a rename rather than a copy.
-                    let directory =
-                        (try? fileManager.url(
-                            for: .itemReplacementDirectory, in: .userDomainMask,
-                            appropriateFor: output, create: true))
-                        ?? fileManager.temporaryDirectory.appending(path: "shrink-\(UUID().uuidString)")
-                    try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-                    scratch = directory
-                    let temporary = directory.appending(path: "compressed.pdf")
+                    let folder = try ScratchFolder(for: output)
+                    scratch = folder
+                    let temporary = folder.url.appending(path: "compressed.pdf")
 
                     let pages = max(1, info.pageCount)
                     let result = try await runStreamingLines(
@@ -223,26 +194,15 @@ public struct PDFCompressor: Sendable {
                         throw TranscodeError.failed(result.failureMessage(tool: "Ghostscript"))
                     }
 
-                    let outputBytes =
-                        (try? temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                        .flatMap(Int64.init) ?? 0
-                    guard Self.shouldKeep(outputBytes: outputBytes, originalBytes: info.byteCount)
-                    else {
-                        let saved = savingsPercent(source: info.byteCount, output: outputBytes)
-                        continuation.yield(
-                            .finished(
-                                .keptOriginal(
-                                    reason: saved.map { "Only \($0)% smaller — kept the original" }
-                                        ?? "Already compact — kept the original")))
+                    let outputBytes = fileByteCount(temporary)
+                    guard Savings.worthKeeping(outputBytes: outputBytes, originalBytes: info.byteCount) else {
+                        let reason = Savings.keptOriginalReason(outputBytes: outputBytes, originalBytes: info.byteCount)
+                        continuation.yield(.finished(.keptOriginal(reason: reason)))
                         continuation.finish()
                         return
                     }
 
-                    if fileManager.fileExists(atPath: output.path) {
-                        _ = try fileManager.replaceItemAt(output, withItemAt: temporary)
-                    } else {
-                        try fileManager.moveItem(at: temporary, to: output)
-                    }
+                    try ScratchFolder.commit(temporary, to: output)
                     continuation.yield(.progress(1))
                     continuation.yield(
                         .finished(

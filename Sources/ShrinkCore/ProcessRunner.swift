@@ -36,8 +36,6 @@ func runStreamingLines(
     environment: [String: String]? = nil,
     onLine: (String) -> Void
 ) async throws -> ProcessResult {
-    try Task.checkCancellation()
-
     let process = Process()
     process.executableURL = executable
     process.arguments = arguments
@@ -63,6 +61,10 @@ func runStreamingLines(
         } catch {
             throw TranscodeError.failed(error.localizedDescription)
         }
+        // A cancel that lands before the process exists finds nothing for the
+        // handler below to stop, and the tool would then run to the end with
+        // nobody watching. Checking only once it has started closes that gap.
+        if Task.isCancelled { process.terminate() }
 
         // Drain stderr alongside stdout: a tool blocks once a pipe buffer
         // fills, so an unread error log would stall it forever.

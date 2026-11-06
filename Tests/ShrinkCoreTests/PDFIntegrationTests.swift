@@ -17,11 +17,11 @@ struct PDFIntegrationTests {
         return directory
     }
 
-    func compress(_ input: URL, quality: PDFQuality = .ebook) async throws -> (events: [PDFEvent], output: URL) {
+    func compress(_ input: URL, quality: PDFQuality = .ebook) async throws -> (events: [ConversionEvent], output: URL) {
         let output = input.deletingLastPathComponent().appending(path: quality.outputFileName(for: input))
         let compressor = compressor
-        let events = try await { () async throws -> [PDFEvent] in
-            var seen: [PDFEvent] = []
+        let events = try await { () async throws -> [ConversionEvent] in
+            var seen: [ConversionEvent] = []
             for try await event in compressor.compress(input: input, output: output, quality: quality) {
                 seen.append(event)
             }

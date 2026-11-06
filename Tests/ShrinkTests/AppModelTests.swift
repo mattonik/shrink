@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import IOKit.pwr_mgt
 import Testing
 
 @testable import Shrink
@@ -7,8 +9,12 @@ import ShrinkTestSupport
 
 /// Drives the app's real conversion queue — the code behind the Shrink and
 /// Cancel buttons — against real files, without opening a window.
+///
+/// One test at a time: the sleep assertion a run holds belongs to the whole
+/// test process, so a parallel run would hide whether this one released it.
 @MainActor
 @Suite(
+    .serialized,
     .enabled(
         if: ToolPaths.locate() != nil && ToolPaths.locateGhostscript() != nil,
         "requires ffmpeg and Ghostscript"))
@@ -104,10 +110,9 @@ struct AppModelTests {
         #expect(try String(contentsOf: existing, encoding: .utf8) == "keep me")
     }
 
-    /// ffmpeg writes straight to its output, so a cancelled video leaves a
-    /// truncated file that has to go — and stay gone: after SIGTERM ffmpeg
-    /// still spends ~0.25 s on its +faststart pass, and the check below waits
-    /// well past that.
+    /// ffmpeg writes into a scratch folder, so a cancelled video never
+    /// reaches its output path, even though after SIGTERM ffmpeg still spends
+    /// ~0.25 s on its +faststart pass. The check below waits well past that.
     @Test func cancellingAVideoRemovesItsPartialOutputForGood() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -127,5 +132,170 @@ struct AppModelTests {
         // Give a still-exiting ffmpeg every chance to put the file back.
         try await Task.sleep(for: .seconds(2))
         #expect(!FileManager.default.fileExists(atPath: output.path), "partial video came back")
+    }
+
+    /// Converting the same file with the same settings again names the same
+    /// output. ffmpeg used to overwrite it from the first frame, and a cancel
+    /// or failure then deleted it, so the earlier good result was lost.
+    @Test func aCancelledVideoLeavesAFileAlreadyAtItsOutputPath() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = try VideoFixtures.makeLong(ffmpeg: ffmpeg, in: directory)
+        let model = AppModel()
+        model.settings = EncodeSettings(resolution: .original, quality: .high)
+        let existing = directory.appending(path: model.settings.outputFileName(for: input))
+        try Data("last week's result".utf8).write(to: existing)
+
+        model.add(urls: [input])
+        try await waitUntil("the video to be read") { model.items.first?.source != nil }
+        model.convert()
+        try await waitUntil("encoding to start") { isConverting(model.items.first?.state) }
+        model.cancel()
+        try await waitUntil("the cancel to land") { !model.isConverting }
+
+        #expect(model.items.first?.state == .cancelled)
+        #expect(try String(contentsOf: existing, encoding: .utf8) == "last week's result")
+    }
+
+    @Test func aFailedVideoLeavesAFileAlreadyAtItsOutputPath() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = try VideoFixtures.make(ffmpeg: ffmpeg, in: directory, name: "demo.mp4")
+        let model = AppModel()
+        let existing = directory.appending(path: model.settings.outputFileName(for: input))
+        try Data("last week's result".utf8).write(to: existing)
+
+        model.add(urls: [input])
+        try await waitUntil("the video to be read") { model.items.first?.source != nil }
+        try FileManager.default.removeItem(at: input)  // moved away before the run starts
+        model.convert()
+        try await waitUntil("the run to finish") { !model.isConverting }
+
+        guard case .failed = model.items.first?.state else {
+            Issue.record("expected the conversion to fail, got \(String(describing: model.items.first?.state))")
+            return
+        }
+        #expect(try String(contentsOf: existing, encoding: .utf8) == "last week's result")
+    }
+
+    /// The second row used to stay on "Reading…" for good: the probe result
+    /// is filed by URL and only ever reached the first.
+    @Test func aFileOpenedTwiceAtOnceIsListedOnce() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let video = try VideoFixtures.make(ffmpeg: ffmpeg, in: directory, name: "demo.mp4")
+
+        let model = AppModel()
+        model.add(urls: [video, video])
+
+        #expect(model.items.count == 1)
+    }
+
+    /// On battery a Mac idles to sleep, which used to stop a long batch until
+    /// someone woke it.
+    @Test func keepsTheMacAwakeOnlyWhileConverting() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = try VideoFixtures.makeLong(ffmpeg: ffmpeg, in: directory)
+        let model = AppModel()
+        model.add(urls: [input])
+        try await waitUntil("the video to be read") { model.items.first?.source != nil }
+        #expect(!holdsIdleSleepAssertion())
+
+        model.convert()
+        try await waitUntil("encoding to start") { isConverting(model.items.first?.state) }
+        #expect(holdsIdleSleepAssertion(), "nothing stops the Mac sleeping mid-run")
+
+        await model.cancelAndWait()
+        #expect(!holdsIdleSleepAssertion(), "the Mac is kept awake after the run")
+    }
+
+    func holdsIdleSleepAssertion() -> Bool {
+        var byProcess: Unmanaged<CFDictionary>?
+        guard IOPMCopyAssertionsByProcess(&byProcess) == kIOReturnSuccess,
+            let all = byProcess?.takeRetainedValue() as? [NSNumber: [[String: Any]]]
+        else { return false }
+        return (all[NSNumber(value: getpid())] ?? []).contains {
+            $0[kIOPMAssertionTypeKey] as? String == kIOPMAssertionTypePreventUserIdleSystemSleep
+        }
+    }
+
+    /// Closing the only window, or Quit, used to exit while ffmpeg carried on
+    /// encoding by itself, with the rest of the queue silently dropped.
+    @Test func quittingMidRunAsksThenStopsTheConversionBeforeExiting() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = try VideoFixtures.makeLong(ffmpeg: ffmpeg, in: directory)
+        let delegate = AppDelegate()
+        let model = delegate.model
+        var asked = 0
+        var reply: Bool?
+        var stateAtReply: (converting: Bool, item: AppModel.Item.State?)?
+        delegate.confirmQuit = { asked += 1; return true }
+        delegate.replyToTerminate = {
+            reply = $0
+            stateAtReply = (model.isConverting, model.items.first?.state)
+        }
+
+        #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateNow, "idle quits at once")
+        #expect(asked == 0, "nothing to ask about while idle")
+
+        model.add(urls: [input])
+        try await waitUntil("the video to be read") { model.items.first?.source != nil }
+        model.convert()
+        try await waitUntil("encoding to start") { isConverting(model.items.first?.state) }
+
+        #expect(!delegate.applicationShouldTerminateAfterLastWindowClosed(NSApplication.shared),
+                "closing the window mid-run must not quit")
+        #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateLater)
+        #expect(asked == 1)
+        try await waitUntil("the quit to be allowed") { reply != nil }
+
+        #expect(reply == true)
+        #expect(stateAtReply?.converting == false, "quit was allowed before the run had stopped")
+        #expect(stateAtReply?.item == .cancelled)
+        #expect(delegate.applicationShouldTerminateAfterLastWindowClosed(NSApplication.shared))
+    }
+
+    @Test func choosingToKeepConvertingCancelsTheQuit() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = try VideoFixtures.makeLong(ffmpeg: ffmpeg, in: directory)
+        let delegate = AppDelegate()
+        let model = delegate.model
+        delegate.confirmQuit = { false }
+        delegate.replyToTerminate = { _ in Issue.record("must not answer a cancelled quit") }
+
+        model.add(urls: [input])
+        try await waitUntil("the video to be read") { model.items.first?.source != nil }
+        model.convert()
+        try await waitUntil("encoding to start") { isConverting(model.items.first?.state) }
+
+        #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(model.isConverting, "the run was stopped anyway")
+        await model.cancelAndWait()
+    }
+
+    /// The row says the original was kept, the way it does for a PDF.
+    @Test func aVideoThatWouldNotShrinkKeepsTheOriginal() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let compact = try VideoFixtures.makeCompact(ffmpeg: ffmpeg, in: directory)
+        let model = AppModel()
+        model.settings = EncodeSettings(resolution: .original)
+
+        model.add(urls: [compact])
+        try await waitUntil("the video to be read") { model.items.first?.source != nil }
+        model.convert()
+        try await waitUntil("the run to finish") { !model.isConverting }
+
+        guard case .skipped(let reason) = model.items.first?.state else {
+            Issue.record("expected the original to be kept, got \(String(describing: model.items.first?.state))")
+            return
+        }
+        #expect(reason.contains("kept the original"))
+        #expect(!FileManager.default.fileExists(
+            atPath: directory.appending(path: model.settings.outputFileName(for: compact)).path))
     }
 }

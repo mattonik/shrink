@@ -10,7 +10,7 @@ private func info(
     duration: Double = 6,
     bytes: Int64 = 233_135,
     audio: Bool = true,
-    subtitles: Bool = false
+    subtitles: [Int] = []
 ) -> VideoInfo {
     VideoInfo(
         size: size,
@@ -18,7 +18,7 @@ private func info(
         byteCount: bytes,
         videoCodec: "h264",
         hasAudio: audio,
-        hasSubtitles: subtitles
+        subtitleStreams: subtitles
     )
 }
 
@@ -36,6 +36,17 @@ private func info(
     #expect(EncodeSettings(resolution: .p720).targetSize(for: hd) == nil)
     #expect(EncodeSettings(resolution: .p1080).targetSize(for: hd) == nil)
     #expect(EncodeSettings(resolution: .original).targetSize(for: fullHD) == nil)
+}
+
+/// x264 refuses odd sides for yuv420p, so a 1437x899 window recording failed
+/// outright whenever its size was kept: with Keep original, or with a preset
+/// bigger than the recording.
+@Test func evensOutAnOddSizedSourceItDoesNotScale() {
+    let window = PixelSize(width: 1437, height: 899)
+    let evened = PixelSize(width: 1436, height: 898)
+    #expect(EncodeSettings(resolution: .original).targetSize(for: window) == evened)
+    #expect(EncodeSettings(resolution: .p1080).targetSize(for: window) == evened)
+    #expect(EncodeSettings(resolution: .p720).targetSize(for: window) == PixelSize(width: 1150, height: 720))
 }
 
 @Test func forcesEvenDimensionsForChromaSubsampling() throws {
@@ -119,11 +130,23 @@ private func info(
     let args = EncodeSettings().arguments(
         input: URL(filePath: "/v/in.mp4"),
         output: URL(filePath: "/v/out.mp4"),
-        info: info(subtitles: true)
+        info: info(subtitles: [2])
     )
 
-    #expect(args.contains("0:s?"))
+    #expect(zip(args, args.dropFirst()).contains { $0 == "-map" && $1 == "0:2" }, "maps the text stream")
+    #expect(!args.contains("0:s?"), "a blanket map would pull in picture subtitles too")
     #expect(consecutive(args, "-c:s") == "mov_text")
+}
+
+@Test func leavesSubtitlesOutWhenThereAreNoneMP4CanCarry() {
+    let args = EncodeSettings().arguments(
+        input: URL(filePath: "/v/in.mkv"),
+        output: URL(filePath: "/v/out.mp4"),
+        info: info()
+    )
+
+    #expect(!args.contains("-c:s"))
+    #expect(!args.contains { $0.hasPrefix("0:s") })
 }
 
 @Test func hevcSitsHigherOnCRFLadderThanH264() {
@@ -151,8 +174,10 @@ private func info(
 
 @Test func parsesProbeJSON() throws {
     let json = """
-        {"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080},
-        {"codec_type":"audio","codec_name":"aac"},{"codec_type":"subtitle","codec_name":"mov_text"}],
+        {"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080},
+        {"index":1,"codec_type":"audio","codec_name":"aac"},
+        {"index":2,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"},
+        {"index":3,"codec_type":"subtitle","codec_name":"subrip"}],
         "format":{"duration":"6.000000"}}
         """
     let parsed = try Transcoder.parseProbe(Data(json.utf8), byteCount: 233_135, name: "demo.mp4")
@@ -161,7 +186,8 @@ private func info(
     #expect(parsed.durationSeconds == 6)
     #expect(parsed.byteCount == 233_135)
     #expect(parsed.hasAudio)
-    #expect(parsed.hasSubtitles)
+    // A Blu-ray's picture subtitles can't become MP4 text; only the SRT track can.
+    #expect(parsed.subtitleStreams == [3])
 }
 
 @Test func rejectsFileWithNoVideoTrack() {

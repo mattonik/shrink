@@ -98,7 +98,7 @@ public struct EncodeSettings: Equatable, Sendable {
         }
     }
 
-    /// Target pixel size, or nil to pass the source resolution through.
+    /// Target pixel size, or nil when the source can be encoded at its own size.
     ///
     /// `source` must be the *display* size (see `VideoInfo.displaySize`), since
     /// ffmpeg rotates before filtering. The `p` presets size the **shorter**
@@ -106,27 +106,29 @@ public struct EncodeSettings: Equatable, Sendable {
     /// 1920x1080 at 720p is 1280x720, and portrait 1080x1920 is 720x1280.
     /// Keying off height instead would shrink portrait clips to a sliver.
     ///
-    /// Only ever scales down — asking 1080p of a 720p source returns nil rather
-    /// than upscaling into a bigger file that holds no extra detail.
+    /// Only ever scales down — asking 1080p of a 720p source keeps 720p rather
+    /// than upscaling into a bigger file that holds no extra detail. Either way
+    /// both sides come out even: a recording of a window can be 1437x899, and
+    /// x264 refuses odd sides for yuv420p even when nothing else changes.
     public func targetSize(for source: PixelSize) -> PixelSize? {
         guard source.width > 0, source.height > 0 else { return nil }
 
         let shorterSide = Double(min(source.width, source.height))
         let factor: Double
         switch resolution {
-        case .original: return nil
+        case .original: factor = 1
         case .pct50: factor = 0.5
         case .pct75: factor = 0.75
         case .p1080: factor = 1080.0 / shorterSide
         case .p720: factor = 720.0 / shorterSide
         case .p480: factor = 480.0 / shorterSide
         }
-        guard factor < 1 else { return nil }
-
-        return PixelSize(
-            width: evenDimension(Double(source.width) * factor),
-            height: evenDimension(Double(source.height) * factor)
+        let scale = min(factor, 1)
+        let target = PixelSize(
+            width: evenDimension(Double(source.width) * scale),
+            height: evenDimension(Double(source.height) * scale)
         )
+        return target == source ? nil : target
     }
 
     /// yuv420p subsamples chroma by two, so both axes have to stay even.
@@ -150,8 +152,8 @@ public struct EncodeSettings: Equatable, Sendable {
         let target = targetSize(for: info.displaySize)
         let withAudio = keepAudio && info.hasAudio
         // Soft subtitles cost almost nothing and some sources carry them, so
-        // they ride along rather than being silently dropped.
-        let withSubtitles = info.hasSubtitles
+        // the ones MP4 can hold ride along rather than being silently dropped.
+        let withSubtitles = !info.subtitleStreams.isEmpty
 
         var args = ["-hide_banner", "-loglevel", "error", "-y", "-i", input.path]
         if let target {
@@ -159,7 +161,7 @@ public struct EncodeSettings: Equatable, Sendable {
         }
         args += ["-map", "0:v:0"]
         if withAudio { args += ["-map", "0:a:0?"] }
-        if withSubtitles { args += ["-map", "0:s?"] }
+        for index in info.subtitleStreams { args += ["-map", "0:\(index)"] }
         args += [
             "-c:v", codec == .h265 ? "libx265" : "libx264",
             "-preset", "medium",

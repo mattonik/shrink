@@ -54,10 +54,10 @@ struct TranscodeIntegrationTests {
         let fractions = try await { () async throws -> [Double] in
             let info = try await transcoder.probe(sample)
             var seen: [Double] = []
-            for try await fraction in transcoder.transcode(
+            for try await event in transcoder.transcode(
                 input: sample, output: output, settings: settings, info: info
             ) {
-                seen.append(fraction)
+                if case .progress(let fraction) = event { seen.append(fraction) }
             }
             return seen
         }()
@@ -189,6 +189,109 @@ struct TranscodeIntegrationTests {
         }()
 
         #expect(result.displaySize == PixelSize(width: 1280, height: 720))
+    }
+
+    /// A recording of part of the screen can have odd sides, which x264
+    /// refuses for yuv420p. Keeping its size used to fail the whole file.
+    @Test func encodesAnOddSizedRecordingAtItsOwnSize() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recording = try VideoFixtures.make(
+            ffmpeg: tools.ffmpeg, in: directory, name: "window.mp4", size: "1437x899", seconds: 1,
+            audio: false, pixelFormat: "yuv444p")
+        let transcoder = Transcoder(tools: tools)
+        let settings = EncodeSettings(resolution: .original, keepAudio: false)
+        let output = directory.appending(path: settings.outputFileName(for: recording))
+
+        let result = try await { () async throws -> VideoInfo in
+            let info = try await transcoder.probe(recording)
+            for try await _ in transcoder.transcode(
+                input: recording, output: output, settings: settings, info: info
+            ) {}
+            return try await transcoder.probe(output)
+        }()
+
+        #expect(result.displaySize == PixelSize(width: 1436, height: 898))
+    }
+
+    /// Picture subtitles can't become MP4 text, and asking ffmpeg to convert
+    /// them fails the whole file, so a Blu-ray rip used to fail outright. Now
+    /// the picture track is left behind and the text track still comes along.
+    @Test func convertsAFileWithPictureSubtitlesKeepingTheTextOnes() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let movie = try VideoFixtures.makeWithSubtitles(ffmpeg: tools.ffmpeg, in: directory)
+        let transcoder = Transcoder(tools: tools)
+        let settings = EncodeSettings(resolution: .original, keepAudio: false)
+        let output = directory.appending(path: settings.outputFileName(for: movie))
+
+        let info = try await transcoder.probe(movie)
+        #expect(info.subtitleStreams == [2], "the PGS track at 1 is a picture, the SRT at 2 is text")
+        for try await _ in transcoder.transcode(input: movie, output: output, settings: settings, info: info) {}
+
+        let streams = try await runCollectingOutput(
+            executable: tools.ffprobe,
+            arguments: ["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", output.path])
+        #expect(String(decoding: streams, as: UTF8.self).split(separator: "\n") == ["h264", "mov_text"])
+    }
+
+    func finalEvent(_ input: URL, _ settings: EncodeSettings) async throws -> (ConversionEvent?, URL) {
+        let transcoder = Transcoder(tools: tools)
+        let output = input.deletingLastPathComponent().appending(path: settings.outputFileName(for: input))
+        let info = try await transcoder.probe(input)
+        var last: ConversionEvent?
+        for try await event in transcoder.transcode(input: input, output: output, settings: settings, info: info) {
+            last = event
+        }
+        return (last, output)
+    }
+
+    /// Re-encoding an already compact video costs quality and here even makes
+    /// it bigger, so, as with PDFs, the original is the answer.
+    @Test func keepsTheOriginalWhenReencodingDoesNotShrinkIt() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let compact = try VideoFixtures.makeCompact(ffmpeg: tools.ffmpeg, in: directory)
+
+        let (last, output) = try await finalEvent(compact, EncodeSettings(resolution: .original))
+
+        guard case .finished(.keptOriginal(let reason)) = last else {
+            Issue.record("expected the original to be kept, got \(String(describing: last))")
+            return
+        }
+        #expect(reason.contains("kept the original"))
+        #expect(!FileManager.default.fileExists(atPath: output.path), "a result that was thrown away was written")
+    }
+
+    /// A muted copy is kept even when it saves almost nothing: the original
+    /// still has its sound, so it can't stand in for what was asked for.
+    @Test func keepsAMutedCopyEvenWhenItIsHardlySmaller() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let compact = try VideoFixtures.makeCompact(ffmpeg: tools.ffmpeg, in: directory)
+        let sourceBytes = try #require(try compact.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+
+        let (last, output) = try await finalEvent(compact, EncodeSettings(resolution: .original, keepAudio: false))
+
+        guard case .finished(.compressed(_, let bytes, _)) = last else {
+            Issue.record("expected the muted copy to be kept, got \(String(describing: last))")
+            return
+        }
+        #expect(Double(bytes) > Double(sourceBytes) * 0.9, "the fixture must save too little to pass on size alone")
+        #expect(try await Transcoder(tools: tools).probe(output).hasAudio == false)
+    }
+
+    /// A cancel that lands before the tool exists used to find nothing to
+    /// stop, and the tool then ran to the end with nobody watching.
+    @Test func aToolStartedAfterItsTaskWasCancelledIsStoppedAtOnce() async throws {
+        let duration = "30.\(Int.random(in: 100_000...999_999))"  // unique, to find it with pgrep
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await runStreamingLines(executable: URL(filePath: "/bin/sleep"), arguments: [duration]) { _ in }
+        }
+
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await waitUntilNoProcess(matching: "sleep \(duration)"), "sleep is still running")
     }
 
     @Test func cancellingStopsFFmpeg() async throws {
