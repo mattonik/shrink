@@ -20,11 +20,20 @@ final class UpdateController {
         let message: String
     }
 
-    /// What a build needs to update itself. Nil for local builds made before a
-    /// Team ID is configured, and for `swift run`, which has no app bundle.
+    /// What a build needs to update itself. Nil for `swift run`, which has no
+    /// app bundle, and for a release build without a Team ID to check against.
     struct Configuration {
+        /// A copy updates the way it was installed, which build.sh records.
+        enum Method {
+            /// A signed release: download the next one and check who signed it.
+            case download(DeveloperIDVerifier)
+            /// Built on this Mac by build.sh: build the next release here too.
+            case build
+        }
+
         let repository: String
-        let verifier: DeveloperIDVerifier
+        let bundleIdentifier: String
+        let method: Method
         let currentVersion: SemanticVersion?
         let appURL: URL
     }
@@ -55,15 +64,32 @@ final class UpdateController {
         guard bundle.bundleURL.pathExtension == "app",
             let info = bundle.infoDictionary,
             let repository = info["ShrinkUpdateRepository"] as? String, !repository.isEmpty,
-            let teamID = info["ShrinkUpdateTeamID"] as? String, !teamID.isEmpty,
-            let identifier = bundle.bundleIdentifier,
-            let verifier = try? DeveloperIDVerifier(teamID: teamID, bundleIdentifier: identifier)
+            let identifier = bundle.bundleIdentifier
         else { return nil }
+
+        let method: Configuration.Method
+        if info["ShrinkUpdateMethod"] as? String == "source" {
+            method = .build
+        } else {
+            guard let teamID = info["ShrinkUpdateTeamID"] as? String, !teamID.isEmpty,
+                let verifier = try? DeveloperIDVerifier(teamID: teamID, bundleIdentifier: identifier)
+            else { return nil }
+            method = .download(verifier)
+        }
         return Configuration(
             repository: repository,
-            verifier: verifier,
+            bundleIdentifier: identifier,
+            method: method,
             currentVersion: (info["CFBundleShortVersionString"] as? String).flatMap(SemanticVersion.init),
             appURL: bundle.bundleURL)
+    }
+
+    var buildsFromSource: Bool {
+        if case .build = configuration?.method { true } else { false }
+    }
+
+    var isInstalling: Bool {
+        if case .installing = phase { true } else { false }
     }
 
     /// GitHub allows 60 unauthenticated requests an hour per IP address, which
@@ -80,7 +106,7 @@ final class UpdateController {
             if userInitiated {
                 notice = Notice(
                     title: "This build can't update itself",
-                    message: "Only signed releases from GitHub update themselves. To update a build you made yourself, run build.sh again.")
+                    message: "Only Shrink.app updates itself, whether it came from GitHub Releases or from build.sh.")
             }
             return
         }
@@ -121,12 +147,19 @@ final class UpdateController {
         guard let configuration else { return }
         phase = .installing(release)
         do {
-            let installer = UpdateInstaller(
-                verifier: configuration.verifier,
-                bundleIdentifier: configuration.verifier.bundleIdentifier)
-            let prepared = try await installer.prepare(
-                release, replacing: configuration.appURL, currentVersion: configuration.currentVersion)
-            try installer.install(prepared, replacing: configuration.appURL)
+            let prepared: PreparedUpdate
+            switch configuration.method {
+            case .download(let verifier):
+                prepared = try await UpdateInstaller(
+                    verifier: verifier, bundleIdentifier: configuration.bundleIdentifier
+                ).prepare(release, replacing: configuration.appURL, currentVersion: configuration.currentVersion)
+            case .build:
+                prepared = try await SourceUpdater(
+                    remote: SourceUpdater.gitHubRemote(configuration.repository),
+                    bundleIdentifier: configuration.bundleIdentifier
+                ).prepare(release, replacing: configuration.appURL, currentVersion: configuration.currentVersion)
+            }
+            try prepared.install(replacing: configuration.appURL)
             relaunch(configuration.appURL)
         } catch {
             phase = .installFailed(release, error.localizedDescription)

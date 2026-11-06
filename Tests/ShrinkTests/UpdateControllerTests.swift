@@ -12,18 +12,21 @@ private actor FeedCalls {
 @MainActor
 @Suite struct UpdateControllerTests {
     /// A real `.app` folder with the Info.plist keys build.sh writes.
-    func bundle(version: String = "1.0.0", teamID: String = "ABCDE12345") throws -> (Bundle, URL) {
+    func bundle(version: String = "1.0.0", teamID: String = "ABCDE12345", method: String? = nil) throws
+        -> (Bundle, URL)
+    {
         let root = URL.temporaryDirectory.appending(path: "shrink-ctl-\(UUID().uuidString)")
         let contents = root.appending(path: "Shrink.app/Contents")
         try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
-        let info: NSDictionary = [
+        var info: [String: String] = [
             "CFBundleIdentifier": "sk.icebear.shrink",
             "CFBundleShortVersionString": version,
             "CFBundlePackageType": "APPL",
             "ShrinkUpdateRepository": "mattonik/shrink",
             "ShrinkUpdateTeamID": teamID,
         ]
-        try info.write(to: contents.appending(path: "Info.plist"))
+        info["ShrinkUpdateMethod"] = method
+        try (info as NSDictionary).write(to: contents.appending(path: "Info.plist"))
         return (try #require(Bundle(url: root.appending(path: "Shrink.app"))), root)
     }
 
@@ -101,7 +104,33 @@ private actor FeedCalls {
         #expect(await calls.count == 1)
     }
 
-    @Test func buildsWithoutATeamIDNeverReachTheNetwork() async throws {
+    @Test func signedReleasesUpdateByDownloadingTheNextRelease() throws {
+        let (bundle, root) = try bundle(method: "release")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = UpdateController(bundle: bundle, defaults: freshDefaults()) { _, _ in nil }
+
+        guard case .download(let verifier) = controller.configuration?.method else {
+            Issue.record("expected a download configuration, got \(String(describing: controller.configuration?.method))")
+            return
+        }
+        #expect(verifier.teamID == "ABCDE12345")
+        #expect(!controller.buildsFromSource)
+    }
+
+    /// A copy built with build.sh rebuilds from source, which involves no
+    /// signature, so it updates even when no Team ID was ever configured.
+    @Test func copiesBuiltFromSourceUpdateWithoutATeamID() async throws {
+        let (bundle, root) = try bundle(teamID: "", method: "source")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let newer = release("1.1.0")
+        let controller = UpdateController(bundle: bundle, defaults: freshDefaults()) { _, _ in newer }
+
+        #expect(controller.buildsFromSource)
+        await controller.check(userInitiated: false)
+        #expect(controller.phase == .available(newer))
+    }
+
+    @Test func releaseBuildsWithoutATeamIDNeverReachTheNetwork() async throws {
         let (bundle, root) = try bundle(teamID: "")
         defer { try? FileManager.default.removeItem(at: root) }
         let calls = FeedCalls()

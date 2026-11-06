@@ -29,9 +29,11 @@ private final class ProcessBox: @unchecked Sendable {
 /// Cancelling the calling task terminates the process and throws
 /// `CancellationError`. The process is launched from an argument array with no
 /// shell in between, so file names can never be interpreted as commands.
+/// `environment` replaces the inherited one when given.
 func runStreamingLines(
     executable: URL,
     arguments: [String],
+    environment: [String: String]? = nil,
     onLine: (String) -> Void
 ) async throws -> ProcessResult {
     try Task.checkCancellation()
@@ -39,6 +41,7 @@ func runStreamingLines(
     let process = Process()
     process.executableURL = executable
     process.arguments = arguments
+    if let environment { process.environment = environment }
     let outputPipe = Pipe()
     let errorPipe = Pipe()
     process.standardOutput = outputPipe
@@ -87,11 +90,13 @@ func runStreamingLines(
 }
 
 /// Runs `executable` to completion and returns its whole stdout.
-func runCollectingOutput(executable: URL, arguments: [String]) async throws -> Data {
+func runCollectingOutput(
+    executable: URL, arguments: [String], environment: [String: String]? = nil
+) async throws -> Data {
     var lines: [String] = []
-    let result = try await runStreamingLines(executable: executable, arguments: arguments) {
-        lines.append($0)
-    }
+    let result = try await runStreamingLines(
+        executable: executable, arguments: arguments, environment: environment
+    ) { lines.append($0) }
     guard result.status == 0 else {
         throw TranscodeError.failed(result.failureMessage(tool: executable.lastPathComponent))
     }

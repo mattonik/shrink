@@ -33,7 +33,8 @@ This builds, signs ad-hoc, and installs to `~/Applications`; pass a folder to
 install somewhere else. An app compiled on your own Mac never gets the
 quarantine flag that Gatekeeper checks, and `~/Applications` is your own folder,
 so no admin password is involved at any point. Use this if your Mac's
-management blocks downloaded apps.
+management blocks downloaded apps. A copy built this way updates itself by
+building each new release from source.
 
 ## Using it
 
@@ -84,9 +85,16 @@ the current file and leaves nothing half-written behind.
 
 ## Updates
 
-Release builds check GitHub at most once a day and show a banner when a newer
-version is out. **Shrink → Check for Updates…** asks on demand. **Update &
-Relaunch** installs the update only after all of these checks pass:
+Shrink checks GitHub at most once a day and shows a banner when a newer release
+is out. **Shrink → Check for Updates…** asks on demand. **Update & Relaunch**
+updates a copy the same way it was installed. Both ways follow published
+releases, not every commit to `main`, so a copy only ever updates to code that
+passed CI.
+
+### A downloaded release
+
+It downloads the next release and installs it only after all of these checks
+pass:
 
 1. The download matches its published SHA-256.
 2. It has the same bundle ID, the version the release claims, and is newer than
@@ -100,8 +108,27 @@ The checksum only proves the download is intact, since it comes from the same
 place as the zip. Proving that the build came from this project is the job of
 the signature and notarisation checks. If any check fails, nothing is changed.
 
-Builds without a Team ID, including anything made before one is set in
-`release.conf`, never contact GitHub; update those by running `./build.sh` again.
+### A copy you built with `build.sh`
+
+It builds the next release on your Mac, as `git pull && ./build.sh` would, and
+downloads nothing pre-built, so it works wherever building by hand works:
+
+1. It fetches the release's tag into its own clone in
+   `~/Library/Application Support/Shrink/Source`. Your own checkout is never
+   touched.
+2. It runs that tag's `build.sh` into a scratch folder.
+3. It swaps the result in only if it is Shrink at the version the release
+   names.
+
+It needs Xcode or the Command Line Tools, and a build takes seconds rather than
+minutes. The clone and its build cache take about 75 MB. A failed build changes
+nothing, and its log is kept in `update-build.log` next to the clone. There is
+no signature to check: as when building by hand, you are trusting what the tag
+contains.
+
+`build.sh` records which kind of copy it made: an ad-hoc signed build updates
+from source, and a Developer ID build downloads. To build a copy that never
+checks for updates, leave `REPOSITORY` empty in `release.conf`.
 
 ## Releasing
 
@@ -186,8 +213,8 @@ swift run Shrink     # run without installing
 ./make-icon.swift    # regenerate Resources/AppIcon.icns
 ```
 
-- `Sources/ShrinkCore`: video and PDF engines, the process runner and the
-  updater. No UI.
+- `Sources/ShrinkCore`: video and PDF engines, the process runner and both
+  updaters. No UI.
 - `Sources/Shrink`: the SwiftUI app, the conversion queue and the update banner.
 - `Sources/ShrinkTestSupport`: generates real test videos and PDFs, including
   signed, password-protected, form and damaged ones. Never linked into the app.
@@ -196,3 +223,13 @@ The integration tests convert real files and then inspect the output, rather
 than trusting argument strings. They skip themselves when the tool they need
 isn't installed. Every safeguard has a test that was checked to fail when the
 safeguard was removed.
+
+Updating from source is tested against a local git repository with a stand-in
+`build.sh`. One test builds the real app from a tagged clone of this
+repository, in the bare environment an app opened from the Finder gets. It
+compiles everything from scratch, so it only runs when asked, and only sees
+committed changes:
+
+```bash
+SHRINK_SOURCE_BUILD=1 swift test --filter buildsTheRealAppFromSource
+```

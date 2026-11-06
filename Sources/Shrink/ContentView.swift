@@ -88,9 +88,10 @@ struct ContentView: View {
             if model.isConverting {
                 Button("Cancel") { model.cancel() }
             } else {
+                // Installing ends in a relaunch, which would cut a conversion off.
                 Button("Shrink") { model.convert() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!model.canConvert)
+                    .disabled(!model.canConvert || updates.isInstalling)
             }
         }
         .padding(.horizontal, 16)
@@ -136,7 +137,10 @@ private struct UpdateBanner: View {
         case .installing(let release):
             bar {
                 ProgressView().controlSize(.small)
-                Text("Installing Shrink \(release.version.description)…")
+                Text(
+                    updates.buildsFromSource
+                        ? "Building Shrink \(release.version.description) from source…"
+                        : "Installing Shrink \(release.version.description)…")
                 Spacer()
             }
         case .installFailed(let release, let message):

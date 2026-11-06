@@ -27,6 +27,10 @@ BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 # workflow passes a Developer ID identity so the build can be notarised.
 SIGN_IDENTITY="${SHRINK_SIGN_IDENTITY:--}"
 
+# A copy updates the way it was made: a signed release downloads the next
+# signed release, and a copy built here builds the next release here too.
+if [ "$SIGN_IDENTITY" = "-" ]; then UPDATE_METHOD=source; else UPDATE_METHOD=release; fi
+
 echo "==> Building release binary"
 swift build -c release
 
@@ -70,6 +74,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>ShrinkUpdateRepository</key><string>$REPOSITORY</string>
   <key>ShrinkUpdateTeamID</key><string>$TEAM_ID</string>
+  <key>ShrinkUpdateMethod</key><string>$UPDATE_METHOD</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.video</string>

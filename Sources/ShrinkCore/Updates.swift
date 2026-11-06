@@ -28,9 +28,21 @@ public struct Release: Equatable, Sendable {
     public let notesURL: URL
     public let archiveURL: URL
     public let checksumURL: URL
+    /// The git tag, which a copy built from source fetches and builds.
+    public let tag: String
 
     public static let archiveName = "Shrink.zip"
     public static let checksumName = "Shrink.zip.sha256"
+
+    public init(
+        version: SemanticVersion, notesURL: URL, archiveURL: URL, checksumURL: URL, tag: String? = nil
+    ) {
+        self.version = version
+        self.notesURL = notesURL
+        self.archiveURL = archiveURL
+        self.checksumURL = checksumURL
+        self.tag = tag ?? "v\(version)"
+    }
 
     /// The GitHub "latest release" payload, or nil when it lacks a usable
     /// version or either asset — a release still uploading looks like this.
@@ -54,7 +66,8 @@ public struct Release: Equatable, Sendable {
         else { return nil }
         return Release(
             version: version, notesURL: payload.html_url,
-            archiveURL: archive.browser_download_url, checksumURL: checksum.browser_download_url)
+            archiveURL: archive.browser_download_url, checksumURL: checksum.browser_download_url,
+            tag: payload.tag_name)
     }
 }
 
@@ -171,6 +184,46 @@ public struct PreparedUpdate: Sendable {
     public let app: URL
     public let version: SemanticVersion
     let scratch: URL
+
+    /// Swaps the prepared app in. The running copy keeps working from memory
+    /// until it quits; the next launch starts the new version.
+    public func install(replacing current: URL) throws {
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        _ = try FileManager.default.replaceItemAt(current, withItemAt: app)
+    }
+
+    /// Checks that apply however the update arrives: it must be newer, and the
+    /// folder the app lives in must let it be replaced.
+    static func checkReplaceable(
+        _ current: URL, with version: SemanticVersion, currentVersion: SemanticVersion?
+    ) throws {
+        if let currentVersion, version <= currentVersion {
+            throw UpdateError.wrongBundle("\(version) is not newer than \(currentVersion)")
+        }
+        let folder = current.deletingLastPathComponent().path
+        guard FileManager.default.isWritableFile(atPath: folder) else {
+            throw UpdateError.notInstallable(
+                "Shrink can't replace itself in \(folder). "
+                    + "Move it to your Applications folder in your home folder and try again.")
+        }
+    }
+
+    /// The new app must be this app, at exactly the version being installed.
+    static func checkBundle(_ app: URL, bundleIdentifier: String, expectedVersion: SemanticVersion) throws {
+        let plist = app.appending(path: "Contents/Info.plist")
+        guard let info = NSDictionary(contentsOf: plist) as? [String: Any] else {
+            throw UpdateError.wrongBundle("it has no readable Info.plist")
+        }
+        guard info["CFBundleIdentifier"] as? String == bundleIdentifier else {
+            throw UpdateError.wrongBundle("bundle identifier \(info["CFBundleIdentifier"] ?? "missing")")
+        }
+        guard let version = (info["CFBundleShortVersionString"] as? String).flatMap(SemanticVersion.init),
+            version == expectedVersion
+        else {
+            throw UpdateError.wrongBundle(
+                "it reports version \(info["CFBundleShortVersionString"] ?? "missing"), expected \(expectedVersion)")
+        }
+    }
 }
 
 public struct UpdateInstaller: Sendable {
@@ -191,15 +244,8 @@ public struct UpdateInstaller: Sendable {
         _ release: Release, replacing current: URL, currentVersion: SemanticVersion?,
         session: URLSession = .shared
     ) async throws -> PreparedUpdate {
-        if let currentVersion, release.version <= currentVersion {
-            throw UpdateError.wrongBundle("\(release.version) is not newer than \(currentVersion)")
-        }
+        try PreparedUpdate.checkReplaceable(current, with: release.version, currentVersion: currentVersion)
         let fileManager = FileManager.default
-        guard fileManager.isWritableFile(atPath: current.deletingLastPathComponent().path) else {
-            throw UpdateError.notInstallable(
-                "Shrink can't replace itself in \(current.deletingLastPathComponent().path). "
-                    + "Move it to your Applications folder in your home folder and try again.")
-        }
 
         let scratch = try fileManager.url(
             for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: current, create: true)
@@ -224,20 +270,14 @@ public struct UpdateInstaller: Sendable {
                 throw UpdateError.unsafeArchive("it doesn't contain \(appName).app")
             }
 
-            try checkBundle(app, expectedVersion: release.version)
+            try PreparedUpdate.checkBundle(
+                app, bundleIdentifier: bundleIdentifier, expectedVersion: release.version)
             try await verifier.verify(app)
             return PreparedUpdate(app: app, version: release.version, scratch: scratch)
         } catch {
             try? fileManager.removeItem(at: scratch)
             throw error
         }
-    }
-
-    /// Swaps the prepared app in. The running copy keeps working from memory
-    /// until it quits; the next launch starts the new version.
-    public func install(_ update: PreparedUpdate, replacing current: URL) throws {
-        defer { try? FileManager.default.removeItem(at: update.scratch) }
-        _ = try FileManager.default.replaceItemAt(current, withItemAt: update.app)
     }
 
     static func parseChecksum(_ text: String) -> String? {
@@ -249,22 +289,6 @@ public struct UpdateInstaller: Sendable {
     static func sha256(of file: URL) -> String? {
         guard let data = try? Data(contentsOf: file, options: .alwaysMapped) else { return nil }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    func checkBundle(_ app: URL, expectedVersion: SemanticVersion) throws {
-        let plist = app.appending(path: "Contents/Info.plist")
-        guard let info = NSDictionary(contentsOf: plist) as? [String: Any] else {
-            throw UpdateError.wrongBundle("it has no readable Info.plist")
-        }
-        guard info["CFBundleIdentifier"] as? String == bundleIdentifier else {
-            throw UpdateError.wrongBundle("bundle identifier \(info["CFBundleIdentifier"] ?? "missing")")
-        }
-        guard let version = (info["CFBundleShortVersionString"] as? String).flatMap(SemanticVersion.init),
-            version == expectedVersion
-        else {
-            throw UpdateError.wrongBundle(
-                "it reports version \(info["CFBundleShortVersionString"] ?? "missing"), expected \(expectedVersion)")
-        }
     }
 
     private func download(_ url: URL, session: URLSession, into directory: URL) async throws -> URL {

@@ -94,7 +94,7 @@ private struct Fixture {
 
         let prepared = try await fixture.prepare(try fixture.release("1.1.0"))
         #expect(fixture.installedVersion == "1.0.0", "nothing changes until install")
-        try fixture.installer().install(prepared, replacing: fixture.installed)
+        try prepared.install(replacing: fixture.installed)
 
         #expect(fixture.installedVersion == "1.1.0")
         #expect(!FileManager.default.fileExists(atPath: prepared.scratch.path), "scratch folder left behind")
