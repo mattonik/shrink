@@ -55,7 +55,7 @@ jobs:
           # upload-artifact drops the executable bit, so ship a zip.
           ditto -c -k --keepParent dist/Shrink.app dist/Shrink-unsigned.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Shrink-unsigned
           path: dist/Shrink-unsigned.zip
