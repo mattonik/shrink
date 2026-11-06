@@ -146,4 +146,46 @@ private actor FeedCalls {
         #expect(await calls.count == 0)
         #expect(controller.notice?.title == "This build can't update itself")
     }
+
+    /// The banner has room for two lines; Details shows the rest, so a failed
+    /// build has to bring its whole log along.
+    @Test func aFailedBuildKeepsItsWholeLogForDetails() async throws {
+        let (bundle, root) = try bundle(version: "1.0.0", method: "source")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let failure = BuildFailure(
+            summary: "Building Shrink 1.1.0 failed: error: cannot find 'oops' in scope.",
+            log: "==> Building release binary\nCompiling Shrink ShrinkApp.swift\n/src/ShrinkApp.swift:3:1: error: cannot find 'oops' in scope",
+            logURL: URL(filePath: "/tmp/update-build.log"))
+        let controller = UpdateController(
+            bundle: bundle, defaults: freshDefaults(), fetch: { _, _ in nil }, prepare: { _, _ in throw failure })
+        let newer = release("1.1.0")
+
+        await controller.install(newer)
+
+        guard case .installFailed(let shown, let details) = controller.phase else {
+            Issue.record("expected a failed install, got \(controller.phase)")
+            return
+        }
+        #expect(shown == newer)
+        #expect(details.message == failure.summary)
+        #expect(details.log == failure.log)
+        #expect(details.logURL == failure.logURL)
+    }
+
+    @Test func otherFailuresHaveNoLogToShow() async throws {
+        let (bundle, root) = try bundle(version: "1.0.0")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = UpdateController(
+            bundle: bundle, defaults: freshDefaults(), fetch: { _, _ in nil },
+            prepare: { _, _ in throw UpdateError.checksumMismatch })
+
+        await controller.install(release("1.1.0"))
+
+        guard case .installFailed(_, let details) = controller.phase else {
+            Issue.record("expected a failed install, got \(controller.phase)")
+            return
+        }
+        #expect(details.message == UpdateError.checksumMismatch.localizedDescription)
+        #expect(details.log == nil)
+    }
 }

@@ -123,12 +123,14 @@ private struct SourceFixture {
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         try fixture.commit(version: "1.1.0", marker: "broken", tag: "v1.1.0", failing: true)
 
-        let error = await #expect(throws: UpdateError.self) { _ = try await fixture.prepare("1.1.0") }
-        let message = try #require(error?.localizedDescription)
-        #expect(message.contains("error: cannot find 'oops' in scope"))
-        #expect(!message.contains("/Users/someone"), "the compiler's long path belongs in the log, not the banner")
-        let log = try String(contentsOf: fixture.updater().logURL, encoding: .utf8)
-        #expect(log.contains("Compiling Shrink"))
+        let failure = try #require(await #expect(throws: BuildFailure.self) { _ = try await fixture.prepare("1.1.0") })
+        #expect(failure.localizedDescription.contains("error: cannot find 'oops' in scope"))
+        #expect(!failure.summary.contains("/Users/someone"), "the compiler's long path belongs in the log, not the banner")
+        // The whole log travels with the failure for the Details window, and is kept on disk.
+        #expect(failure.log.contains("Compiling Shrink"))
+        #expect(failure.log.contains("/Users/someone/src/Sources/Shrink/ShrinkApp.swift:3:1"))
+        #expect(failure.logURL == fixture.updater().logURL)
+        #expect(try String(contentsOf: failure.logURL, encoding: .utf8) == failure.log)
         #expect(fixture.installedMarker == "installed")
     }
 

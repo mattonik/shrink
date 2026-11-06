@@ -11,7 +11,22 @@ final class UpdateController {
         case checking
         case available(Release)
         case installing(Release)
-        case installFailed(Release, String)
+        case installFailed(Release, Failure)
+    }
+
+    /// Why an install failed: the banner shows the message, Details the rest.
+    struct Failure: Equatable {
+        let message: String
+        /// Everything a failed source build printed.
+        let log: String?
+        let logURL: URL?
+
+        init(_ error: any Error) {
+            message = error.localizedDescription
+            let build = error as? BuildFailure
+            log = build?.log
+            logURL = build?.logURL
+        }
     }
 
     struct Notice: Identifiable, Equatable {
@@ -22,9 +37,9 @@ final class UpdateController {
 
     /// What a build needs to update itself. Nil for `swift run`, which has no
     /// app bundle, and for a release build without a Team ID to check against.
-    struct Configuration {
+    struct Configuration: Sendable {
         /// A copy updates the way it was installed, which build.sh records.
-        enum Method {
+        enum Method: Sendable {
             /// A signed release: download the next one and check who signed it.
             case download(DeveloperIDVerifier)
             /// Built on this Mac by build.sh: build the next release here too.
@@ -39,6 +54,8 @@ final class UpdateController {
     }
 
     typealias Fetch = @Sendable (_ repository: String, _ userAgent: String) async throws -> Release?
+    /// Downloads or builds a release, ready to swap in.
+    typealias Prepare = @Sendable (Release, Configuration) async throws -> PreparedUpdate
 
     private(set) var phase: Phase = .idle
     /// Result of a check the user asked for; background checks stay silent.
@@ -46,6 +63,7 @@ final class UpdateController {
     let configuration: Configuration?
 
     private let fetch: Fetch
+    private let prepare: Prepare
     private let defaults: UserDefaults
     static let lastCheckKey = "lastUpdateCheck"
     static let checkInterval: TimeInterval = 24 * 60 * 60
@@ -53,11 +71,26 @@ final class UpdateController {
     init(
         bundle: Bundle = .main,
         defaults: UserDefaults = .standard,
-        fetch: @escaping Fetch = { try await ReleaseFeed.latest(repository: $0, userAgent: $1) }
+        fetch: @escaping Fetch = { try await ReleaseFeed.latest(repository: $0, userAgent: $1) },
+        prepare: @escaping Prepare = UpdateController.prepareUpdate
     ) {
         configuration = Self.configuration(from: bundle)
         self.defaults = defaults
         self.fetch = fetch
+        self.prepare = prepare
+    }
+
+    static let prepareUpdate: Prepare = { release, configuration in
+        switch configuration.method {
+        case .download(let verifier):
+            try await UpdateInstaller(verifier: verifier, bundleIdentifier: configuration.bundleIdentifier)
+                .prepare(release, replacing: configuration.appURL, currentVersion: configuration.currentVersion)
+        case .build:
+            try await SourceUpdater(
+                remote: SourceUpdater.gitHubRemote(configuration.repository),
+                bundleIdentifier: configuration.bundleIdentifier
+            ).prepare(release, replacing: configuration.appURL, currentVersion: configuration.currentVersion)
+        }
     }
 
     static func configuration(from bundle: Bundle) -> Configuration? {
@@ -147,22 +180,11 @@ final class UpdateController {
         guard let configuration else { return }
         phase = .installing(release)
         do {
-            let prepared: PreparedUpdate
-            switch configuration.method {
-            case .download(let verifier):
-                prepared = try await UpdateInstaller(
-                    verifier: verifier, bundleIdentifier: configuration.bundleIdentifier
-                ).prepare(release, replacing: configuration.appURL, currentVersion: configuration.currentVersion)
-            case .build:
-                prepared = try await SourceUpdater(
-                    remote: SourceUpdater.gitHubRemote(configuration.repository),
-                    bundleIdentifier: configuration.bundleIdentifier
-                ).prepare(release, replacing: configuration.appURL, currentVersion: configuration.currentVersion)
-            }
+            let prepared = try await prepare(release, configuration)
             try prepared.install(replacing: configuration.appURL)
             relaunch(configuration.appURL)
         } catch {
-            phase = .installFailed(release, error.localizedDescription)
+            phase = .installFailed(release, Failure(error))
         }
     }
 

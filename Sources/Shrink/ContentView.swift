@@ -1,3 +1,4 @@
+import AppKit
 import ShrinkCore
 import SwiftUI
 
@@ -120,6 +121,7 @@ struct ContentView: View {
 private struct UpdateBanner: View {
     let updates: UpdateController
     let isConverting: Bool
+    @State private var showsDetails = false
 
     var body: some View {
         switch updates.phase {
@@ -143,14 +145,19 @@ private struct UpdateBanner: View {
                         : "Installing Shrink \(release.version.description)…")
                 Spacer()
             }
-        case .installFailed(let release, let message):
+        case .installFailed(let release, let failure):
             bar {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                Text(message).lineLimit(2).font(.callout)
+                Text(failure.message).lineLimit(2).font(.callout)
                 Spacer()
+                // Two lines rarely fit the whole message, let alone a build log.
+                Button("Details…") { showsDetails = true }
                 Button("Try Again") { Task { await updates.install(release) } }
                     .disabled(isConverting)
                 dismissButton
+            }
+            .sheet(isPresented: $showsDetails) {
+                UpdateFailureDetails(release: release, failure: failure)
             }
         case .idle, .checking:
             EmptyView()
@@ -175,6 +182,58 @@ private struct UpdateBanner: View {
             Divider()
         }
         .background(.bar)
+    }
+}
+
+/// The whole story of a failed update: the full message, and for a copy
+/// built from source, everything the build printed.
+private struct UpdateFailureDetails: View {
+    let release: Release
+    let failure: UpdateController.Failure
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Shrink \(release.version.description) wasn't installed")
+                .font(.headline)
+            Text(failure.message)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if let log = failure.log {
+                GeometryReader { box in
+                    ScrollView {
+                        Text(log.isEmpty ? "The build printed nothing." : log)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(8)
+                            // A short log starts at the top rather than hanging at the bottom.
+                            .frame(maxWidth: .infinity, minHeight: box.size.height, alignment: .topLeading)
+                    }
+                    .defaultScrollAnchor(.bottom)  // the error that stopped the build is at the end
+                }
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.separator))
+            }
+            HStack {
+                if let log = failure.log {
+                    Button("Copy Log") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(log, forType: .string)
+                    }
+                }
+                if let url = failure.logURL, FileManager.default.fileExists(atPath: url.path) {
+                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(
+            minWidth: 560, idealWidth: 680, maxWidth: .infinity,
+            minHeight: failure.log == nil ? nil : 380, idealHeight: failure.log == nil ? nil : 480,
+            maxHeight: .infinity)
     }
 }
 

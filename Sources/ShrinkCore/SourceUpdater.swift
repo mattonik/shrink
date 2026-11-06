@@ -1,5 +1,16 @@
 import Foundation
 
+/// A source build that failed, with everything it printed. The banner has
+/// room for the summary; the app shows the whole log on request.
+public struct BuildFailure: LocalizedError, Equatable {
+    public let summary: String
+    public let log: String
+    /// Where the same log is kept on disk.
+    public let logURL: URL
+
+    public var errorDescription: String? { summary }
+}
+
 /// Updates a copy of Shrink that was built on this Mac by building the new
 /// release here too: what `git pull && ./build.sh` does by hand.
 ///
@@ -123,14 +134,14 @@ public struct SourceUpdater: Sendable {
             environment: environment
         ) { lines.append($0) }
         lines += result.standardError.split(separator: "\n").map(String.init)
-        try? lines.joined(separator: "\n").write(to: logURL, atomically: true, encoding: .utf8)
+        let log = lines.joined(separator: "\n")
+        try? log.write(to: logURL, atomically: true, encoding: .utf8)
 
         guard result.status == 0 else {
             // Compiler errors arrive as "/long/path/File.swift:3:1: error: …".
             let reason = lines.last { $0.contains("error:") }
                 .map { ": " + $0[$0.range(of: "error:")!.lowerBound...] } ?? ""
-            throw UpdateError.notInstallable(
-                "Building Shrink \(version) failed\(reason). The full log is in \(logURL.path).")
+            throw BuildFailure(summary: "Building Shrink \(version) failed\(reason).", log: log, logURL: logURL)
         }
     }
 

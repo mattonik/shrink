@@ -133,7 +133,8 @@ downloads nothing pre-built, so it works wherever building by hand works:
 
 It needs Xcode or the Command Line Tools, and a build takes seconds rather than
 minutes. The clone and its build cache take about 75 MB. A failed build changes
-nothing, and its log is kept in `update-build.log` next to the clone. There is
+nothing. **Details…** on the banner shows everything the build printed, which is
+also kept in `update-build.log` next to the clone. There is
 no signature to check: as when building by hand, you are trusting what the tag
 contains.
 
