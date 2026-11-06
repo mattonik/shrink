@@ -168,11 +168,11 @@ public struct Transcoder: Sendable {
             throw TranscodeError.noVideoStream(name)
         }
         // Modern ffprobe reports rotation in the Display Matrix side data;
-        // older files only carry a `rotate` tag, so both are read.
-        let rotation =
-            video.side_data_list?.compactMap(\.rotation).first
-            ?? video.tags?["rotate"].flatMap(Double.init)
-            ?? 0
+        // older files only carry a `rotate` tag, so both are read. Typed step
+        // by step: Swift 6.2 can't infer the types of the whole chain at once.
+        let matrixRotation: Double? = video.side_data_list?.compactMap(\.rotation).first
+        let tagRotation: Double? = video.tags?["rotate"].flatMap { Double($0) }
+        let rotation: Double = matrixRotation ?? tagRotation ?? 0
 
         return VideoInfo(
             size: PixelSize(width: video.width ?? 0, height: video.height ?? 0),
